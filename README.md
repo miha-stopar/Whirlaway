@@ -2,6 +2,10 @@
 
 A hash-based SNARK with lightweight proofs, powered by the [Whir](https://eprint.iacr.org/2024/1586) Polynomial Commitment Scheme.
 
+## Development has moved to: [leanMultisig](https://github.com/leanEthereum/leanMultisig)
+
+The latest PRs included in *Whirlaway* will be included in *leanMultisig* eventually.
+
 ## Proving System
 
 The protocol is detailed in [Whirlaway.pdf](Whirlaway.pdf)
