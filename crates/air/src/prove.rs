@@ -7,11 +7,12 @@ use p3_symmetric::{CryptographicHasher, PseudoCompressionFunction};
 use p3_util::log2_strict_usize;
 use serde::{Deserialize, Serialize};
 use sumcheck::{SumcheckComputation, SumcheckComputationPacked, SumcheckGrinding};
-use tracing::{Level, info_span, instrument, span};
+use tracing::{Level, info, info_span, instrument, span};
 use utils::{
     ConstraintFolder, ConstraintFolderPacked, add_multilinears, multilinears_linear_combination,
     packed_multilinear,
 };
+use std::time::Instant;
 use whir_p3::{
     dft::EvalsDft,
     fiat_shamir::prover::ProverState,
@@ -64,6 +65,13 @@ where
         [F; DIGEST_ELEMS]: Serialize + for<'de> Deserialize<'de>,
         F: Eq + Packable,
     {
+        let prove_start = Instant::now();
+        info!(
+            log_length = self.log_length,
+            n_constraints = self.n_constraints,
+            n_witness_columns = self.n_witness_columns(),
+            "air prove started"
+        );
         assert!(
             settings.univariate_skips < self.log_length,
             "TODO handle the case UNIVARIATE_SKIPS >= log_length"
@@ -88,7 +96,12 @@ where
                 - log2_strict_usize(ext_dim)),
         );
 
+        let commit_start = Instant::now();
         let packed_witness = committer.commit(&dft, prover_state, packed_pol).unwrap();
+        info!(
+            elapsed_ms = commit_start.elapsed().as_secs_f64() * 1_000.0,
+            "air prove: witness commitment complete"
+        );
 
         self.constraints_batching_pow(prover_state, settings)
             .unwrap();
@@ -111,6 +124,7 @@ where
             .iter()
             .chain(&witness)
             .collect::<Vec<_>>();
+        let zerocheck_start = Instant::now();
         let (zerocheck_challenges, all_inner_sums, _) = info_span!("zerocheck").in_scope(|| {
             sumcheck::prove(
                 settings.univariate_skips,
@@ -129,6 +143,10 @@ where
                 None,
             )
         });
+        info!(
+            elapsed_ms = zerocheck_start.elapsed().as_secs_f64() * 1_000.0,
+            "air prove: zerocheck complete"
+        );
 
         let _span = span!(Level::INFO, "inner sumchecks").entered();
 
@@ -190,6 +208,7 @@ where
         let inner_sum = info_span!("inner sum evaluation")
             .in_scope(|| batched_column_mixed.evaluate(&MultilinearPoint(point.clone())));
 
+        let inner_sumcheck_start = Instant::now();
         let (inner_challenges, inner_evals, _) = sumcheck::prove(
             1,
             &mles_for_inner_sumcheck,
@@ -206,6 +225,10 @@ where
             },
             None,
         );
+        info!(
+            elapsed_ms = inner_sumcheck_start.elapsed().as_secs_f64() * 1_000.0,
+            "air prove: inner sumcheck complete"
+        );
 
         let final_point = [columns_batching_scalars.clone(), inner_challenges].concat();
 
@@ -220,9 +243,18 @@ where
             Weights::evaluation(MultilinearPoint(final_point)),
             packed_value,
         );
+        let whir_prove_start = Instant::now();
         prover
             .prove(&dft, prover_state, statement, packed_witness)
             .unwrap();
+        info!(
+            elapsed_ms = whir_prove_start.elapsed().as_secs_f64() * 1_000.0,
+            "air prove: whir prover complete"
+        );
+        info!(
+            elapsed_ms = prove_start.elapsed().as_secs_f64() * 1_000.0,
+            "air prove complete"
+        );
     }
 }
 

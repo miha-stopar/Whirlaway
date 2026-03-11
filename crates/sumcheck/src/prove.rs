@@ -1,10 +1,10 @@
-use std::{any::TypeId, borrow::Borrow};
+use std::{any::TypeId, borrow::Borrow, time::Instant};
 
 use p3_challenger::{FieldChallenger, GrindingChallenger};
 use p3_field::{BasedVectorSpace, PackedValue};
 use p3_field::{ExtensionField, Field, TwoAdicField};
 use rayon::prelude::*;
-use tracing::instrument;
+use tracing::{info, instrument};
 use utils::{
     batch_fold_multilinear_in_large_field, batch_fold_multilinear_in_small_field,
     univariate_selectors,
@@ -43,6 +43,7 @@ where
         + SumcheckComputationPacked<F, EF>,
     Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F>,
 {
+    let prove_start = Instant::now();
     let multilinears = multilinears.iter().map(|m| m.borrow()).collect::<Vec<_>>();
     let mut n_vars = multilinears[0].num_variables();
     assert!(multilinears.iter().all(|m| m.num_variables() == n_vars));
@@ -53,6 +54,7 @@ where
         assert_eq!(eq_factor.len(), n_vars - skips + 1);
     }
 
+    let round_start = Instant::now();
     let mut folded_multilinears = sc_round(
         skips,
         &multilinears,
@@ -69,8 +71,15 @@ where
         0,
         &mut missing_mul_factor,
     );
+    info!(
+        round = 0,
+        skipped_variables = skips,
+        elapsed_ms = round_start.elapsed().as_secs_f64() * 1_000.0,
+        "sumcheck round complete"
+    );
 
     for i in 1..n_rounds {
+        let round_start = Instant::now();
         folded_multilinears = sc_round(
             1,
             &folded_multilinears.iter().collect::<Vec<_>>(),
@@ -87,7 +96,19 @@ where
             i,
             &mut missing_mul_factor,
         );
+        info!(
+            round = i,
+            skipped_variables = 1,
+            elapsed_ms = round_start.elapsed().as_secs_f64() * 1_000.0,
+            "sumcheck round complete"
+        );
     }
+
+    info!(
+        total_rounds = n_rounds,
+        elapsed_ms = prove_start.elapsed().as_secs_f64() * 1_000.0,
+        "sumcheck prove complete"
+    );
 
     (challenges, folded_multilinears, sum)
 }
