@@ -3,6 +3,10 @@ name = "air"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+gpu = ["sumcheck/gpu"]
+
 [lints]
 workspace = true
 
@@ -22,4 +26,5 @@ serde.workspace = true
 
 [dev-dependencies]
 p3-koala-bear.workspace = true
+p3-matrix.workspace = true
 rand.workspace = true

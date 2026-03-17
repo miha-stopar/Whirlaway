@@ -3,6 +3,10 @@ name = "sumcheck"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+gpu = []
+
 [lints]
 workspace = true
 
@@ -15,6 +19,7 @@ p3-air.workspace = true
 p3-matrix.workspace = true
 p3-challenger.workspace = true
 whir-p3.workspace = true
+smallvec = "1.13.2"
 
 [dev-dependencies]
 p3-koala-bear.workspace = true

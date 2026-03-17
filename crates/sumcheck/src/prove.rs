@@ -1,20 +1,22 @@
-use std::{any::TypeId, borrow::Borrow, time::Instant};
+use std::{borrow::Borrow, time::Instant};
 
 use p3_challenger::{FieldChallenger, GrindingChallenger};
-use p3_field::{BasedVectorSpace, PackedValue};
 use p3_field::{ExtensionField, Field, TwoAdicField};
 use rayon::prelude::*;
 use tracing::{info, instrument};
-use utils::{
-    batch_fold_multilinear_in_large_field, batch_fold_multilinear_in_small_field,
-    univariate_selectors,
-};
+use utils::univariate_selectors;
 use whir_p3::{
     fiat_shamir::prover::ProverState,
     poly::{dense::WhirDensePolynomial, evals::EvaluationsList},
 };
 
-use crate::{SumcheckComputation, SumcheckComputationPacked, SumcheckGrinding};
+use crate::{
+    SumcheckComputation, SumcheckComputationPacked, SumcheckGrinding,
+    backend::{
+        batch_fold_multilinear_in_large_field, batch_fold_multilinear_in_small_field,
+        compute_over_hypercube,
+    },
+};
 
 pub const MIN_VARS_FOR_GPU: usize = 0; // When there are a small number of variables, it's not worth using GPU
 
@@ -272,71 +274,6 @@ where
     };
 
     batch_fold_multilinear_in_large_field(multilinears, &folding_scalars)
-}
-
-fn compute_over_hypercube<F, NF, EF, SC>(
-    pols: &[EvaluationsList<NF>],
-    computation: &SC,
-    batching_scalars: &[EF],
-    eq_mle: Option<&EvaluationsList<EF>>,
-) -> EF
-where
-    F: Field,
-    NF: ExtensionField<F>,
-    EF: ExtensionField<NF> + ExtensionField<F>,
-    SC: SumcheckComputation<F, NF, EF> + SumcheckComputationPacked<F, EF>,
-{
-    assert!(
-        pols.iter()
-            .all(|p| p.num_variables() == pols[0].num_variables())
-    );
-    let n_vars = pols[0].num_variables();
-    if TypeId::of::<NF>() == TypeId::of::<F>() {
-        let pols: &[EvaluationsList<F>] = unsafe { std::mem::transmute(pols) };
-        let packed_pols = pols
-            .iter()
-            .map(|p| F::Packing::pack_slice(p.evals()))
-            .collect::<Vec<_>>();
-
-        let decomposed_batching_scalars: Vec<_> = (0..<EF as BasedVectorSpace<F>>::DIMENSION)
-            .map(|i| {
-                batching_scalars
-                    .iter()
-                    .map(|x| x.as_basis_coefficients_slice()[i])
-                    .collect()
-            })
-            .collect();
-
-        (0..(1 << n_vars) / F::Packing::WIDTH)
-            .into_par_iter()
-            .enumerate()
-            .map(|(x, i)| {
-                let point = packed_pols.iter().map(|pol| pol[x]).collect::<Vec<_>>();
-                let res =
-                    computation.eval_packed(&point, batching_scalars, &decomposed_batching_scalars);
-                if let Some(eq_mle) = eq_mle {
-                    res.enumerate()
-                        .map(|(idx_in_packing, res)| {
-                            res * eq_mle.evals()[i * F::Packing::WIDTH + idx_in_packing]
-                        })
-                        .sum()
-                } else {
-                    res.sum()
-                }
-            })
-            .sum()
-    } else {
-        // TODO packing everywhere
-        assert_eq!(TypeId::of::<NF>(), TypeId::of::<EF>());
-        (0..1 << n_vars)
-            .into_par_iter()
-            .map(|x| {
-                let point = pols.iter().map(|pol| pol.evals()[x]).collect::<Vec<_>>();
-                let eq_mle_eval = eq_mle.map(|p| p.evals()[x]);
-                eval_sumcheck_computation(computation, batching_scalars, &point, eq_mle_eval)
-            })
-            .sum()
-    }
 }
 
 pub fn eval_sumcheck_computation<F, NF, EF, SC>(

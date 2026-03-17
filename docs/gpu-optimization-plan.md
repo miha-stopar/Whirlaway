@@ -51,14 +51,32 @@ This branch documents and tracks GPU-focused optimization attempts for proving.
 
 ## Initial Deliverables
 
-- Baseline benchmark table for current CPU prover.
-- Feature-gated kernel abstraction for sumcheck compute path.
+- Baseline benchmark table for current CPU prover. Status: `benches/poseidon2_benchmarks.rs` now captures prover-only timings from the Poseidon2 example.
+- Feature-gated kernel abstraction for sumcheck compute path. Status: landed as a dispatch seam with CPU fallback in `crates/sumcheck/src/backend.rs`.
+- Witness-side batching helper for AIR prover. Status: landed as `crates/air/src/backend.rs`, including a smaller-domain combine path for `sub_evals` and `inner_sum`.
 - First GPU implementation of hypercube reduction with parity tests against CPU.
 - Performance report: wall time, speedup, and memory transfer overhead.
+
+## Current Baseline
+
+- Date: 2026-03-17
+- Command: `cargo bench --bench poseidon2_benchmarks -- --noplot`
+- Scope: prover-only timing from the Poseidon2 example, with `security_bits = 128`, `log_inv_rate = 1`, `univariate_skips = 4`, and no preprocessed columns.
+- `log_n_rows = 16`: `time = [1.3415 s, 1.3778 s, 1.4181 s]`, roughly `47.6k` hashes/s at the median.
+- `log_n_rows = 18`: `time = [7.3457 s, 8.2344 s, 9.2595 s]`, roughly `31.8k` hashes/s at the median.
+- Note: `log_n_rows = 14` was removed from the baseline set because full prove+verify with the same parameters hit `Sumcheck(InvalidRound)` in verification.
+
+## Current Constraint
+
+- Generic `compute_over_hypercube` is still host-only even with the `gpu` feature enabled.
+- Reason: the hot loop evaluates an arbitrary Rust `SumcheckComputation`/`Air` callback, which cannot be shipped to a device kernel without a lower-level circuit or expression representation.
+- Practical GPU targets remain the fold kernels and witness-side batching path; a real device implementation for hypercube reduction needs a serialized kernel IR or a computation-specific backend.
+- Progress: `air::kernel_ir` now compiles AIR constraints into a flat instruction program from Plonky3's symbolic builder, giving a concrete starting point for a computation-specific GPU backend.
+- Progress: that IR is now executable on CPU via `ConstraintProgram::evaluate`, so we can validate compiled constraint programs against the existing symbolic AIR path before introducing device kernels.
+- Validation: the Poseidon2 AIR remains a GPU-candidate subset (`148` constraints, `0` unsupported features), and the compiled program now matches the original symbolic constraints on generated trace rows.
 
 ## Out of Scope (for now)
 
 - Verifier-side GPU acceleration.
 - Protocol-level changes.
 - Aggressive unsafe refactors unrelated to measured bottlenecks.
-

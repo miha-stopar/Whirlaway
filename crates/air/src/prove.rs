@@ -6,13 +6,10 @@ use p3_field::{
 use p3_symmetric::{CryptographicHasher, PseudoCompressionFunction};
 use p3_util::log2_strict_usize;
 use serde::{Deserialize, Serialize};
+use std::time::Instant;
 use sumcheck::{SumcheckComputation, SumcheckComputationPacked, SumcheckGrinding};
 use tracing::{Level, info, info_span, instrument, span};
-use utils::{
-    ConstraintFolder, ConstraintFolderPacked, add_multilinears, multilinears_linear_combination,
-    packed_multilinear,
-};
-use std::time::Instant;
+use utils::{ConstraintFolder, ConstraintFolderPacked, add_multilinears, packed_multilinear};
 use whir_p3::{
     dft::EvalsDft,
     fiat_shamir::prover::ProverState,
@@ -26,8 +23,9 @@ use whir_p3::{
 
 use crate::{
     AirSettings,
+    backend::prepare_batched_witness,
     uni_skip_utils::{matrix_down_folded, matrix_up_folded},
-    utils::{column_down, column_up, columns_up_and_down},
+    utils::columns_up_and_down,
 };
 
 use super::table::AirTable;
@@ -172,28 +170,24 @@ where
             *challenge = prover_state.sample();
         }
 
-        let batched_column = multilinears_linear_combination(
-            &witness,
-            &EvaluationsList::eval_eq(&columns_batching_scalars).evals()[..witness.len()],
-        );
-
         let alpha = prover_state.sample();
-
-        let batched_column_mixed = add_multilinears(
-            &column_up(&batched_column),
-            &column_down(&batched_column).scale(alpha),
-        );
-
-        // TODO opti
-        let sub_evals =
-            &batched_column_mixed.fold(&MultilinearPoint(zerocheck_challenges[1..].to_vec()));
-
-        prover_state.add_extension_scalars(sub_evals);
 
         let mut epsilons = vec![EF::ZERO; settings.univariate_skips];
         for challenge in &mut epsilons {
             *challenge = prover_state.sample();
         }
+
+        let batched_witness = info_span!("batched witness preparation").in_scope(|| {
+            prepare_batched_witness(
+                &witness,
+                &columns_batching_scalars,
+                alpha,
+                &zerocheck_challenges[1..],
+                &epsilons,
+            )
+        });
+
+        prover_state.add_extension_scalars(batched_witness.sub_evals.evals());
 
         let point = [epsilons.clone(), zerocheck_challenges[1..].to_vec()].concat();
         let mles_for_inner_sumcheck = vec![
@@ -201,12 +195,8 @@ where
                 &matrix_up_folded(&point),
                 &matrix_down_folded(&point).scale(alpha),
             ),
-            batched_column,
+            batched_witness.batched_column,
         ];
-
-        // TODO do not recompute
-        let inner_sum = info_span!("inner sum evaluation")
-            .in_scope(|| batched_column_mixed.evaluate(&MultilinearPoint(point.clone())));
 
         let inner_sumcheck_start = Instant::now();
         let (inner_challenges, inner_evals, _) = sumcheck::prove(
@@ -218,7 +208,7 @@ where
             None,
             false,
             prover_state,
-            inner_sum,
+            batched_witness.inner_sum,
             None,
             SumcheckGrinding::Auto {
                 security_bits: settings.security_bits,

@@ -3,6 +3,10 @@ name = "whirlaway"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+gpu = ["air/gpu"]
+
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
@@ -154,4 +158,8 @@ utils = { path = "crates/utils" }
 
 [[bench]]
 name = "folding_benchmarks"
+harness = false
+
+[[bench]]
+name = "poseidon2_benchmarks"
 harness = false

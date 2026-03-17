@@ -1,11 +1,8 @@
 #![cfg_attr(not(test), allow(unused_crate_dependencies))]
 
-mod examples;
-
 use air::AirSettings;
 use whir_p3::parameters::{FoldingFactor, errors::SecurityAssumption};
-
-use crate::examples::poseidon2::prove_poseidon2;
+use whirlaway::examples::poseidon2::prove_poseidon2;
 
 const SECURITY_BITS: usize = 128;
 
