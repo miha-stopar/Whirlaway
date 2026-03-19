@@ -3,6 +3,7 @@ use p3_challenger::{FieldChallenger, GrindingChallenger};
 use p3_field::{
     BasedVectorSpace, ExtensionField, Field, Packable, TwoAdicField, cyclic_subgroup_known_order,
 };
+use p3_uni_stark::SymbolicAirBuilder;
 use p3_symmetric::{CryptographicHasher, PseudoCompressionFunction};
 use p3_util::log2_strict_usize;
 use serde::{Deserialize, Serialize};
@@ -28,6 +29,14 @@ use crate::{
     utils::columns_up_and_down,
 };
 
+#[cfg(feature = "gpu")]
+use crate::{
+    backend::{
+        ConstraintProgramExtensionHypercubeEvaluator, ConstraintProgramHypercubeEvaluator,
+    },
+    kernel_ir::compile_air_constraint_program,
+};
+
 use super::table::AirTable;
 
 /* Multi Column CCS (SuperSpartan)
@@ -40,6 +49,7 @@ impl<F, EF, A> AirTable<F, EF, A>
 where
     F: TwoAdicField,
     EF: ExtensionField<F> + TwoAdicField,
+    A: Air<SymbolicAirBuilder<F>>,
     A: for<'a> Air<ConstraintFolder<'a, F, F, EF>>
         + for<'a> Air<ConstraintFolder<'a, F, EF, EF>>
         + for<'a> Air<ConstraintFolderPacked<'a, F, EF>>,
@@ -123,6 +133,43 @@ where
             .chain(&witness)
             .collect::<Vec<_>>();
         let zerocheck_start = Instant::now();
+        #[cfg(feature = "gpu")]
+        let (zerocheck_challenges, all_inner_sums, _) = info_span!("zerocheck").in_scope(|| {
+            let constraint_program = compile_air_constraint_program::<F, _>(&self.air, 0, 0);
+            let lowered_constraint_program = constraint_program.lower();
+            let compiled_base_hypercube_evaluator = constraint_program
+                .is_gpu_candidate()
+                .then(|| ConstraintProgramHypercubeEvaluator::new(&lowered_constraint_program));
+            let compiled_extension_hypercube_evaluator = constraint_program
+                .is_gpu_candidate()
+                .then(|| {
+                    ConstraintProgramExtensionHypercubeEvaluator::new(&lowered_constraint_program)
+                });
+
+            sumcheck::prove_with_hypercube_evaluator(
+                settings.univariate_skips,
+                &columns_up_and_down(&preprocessed_and_witness),
+                &self.air,
+                self.constraint_degree,
+                &constraints_batching_scalars,
+                Some(&zerocheck_challenges),
+                true,
+                prover_state,
+                EF::ZERO,
+                None,
+                SumcheckGrinding::Auto {
+                    security_bits: settings.security_bits,
+                },
+                None,
+                compiled_base_hypercube_evaluator
+                    .as_ref()
+                    .map(|evaluator| evaluator as &dyn sumcheck::HypercubeEvaluator<F, F, EF, A>),
+                compiled_extension_hypercube_evaluator
+                    .as_ref()
+                    .map(|evaluator| evaluator as &dyn sumcheck::HypercubeEvaluator<F, EF, EF, A>),
+            )
+        });
+        #[cfg(not(feature = "gpu"))]
         let (zerocheck_challenges, all_inner_sums, _) = info_span!("zerocheck").in_scope(|| {
             sumcheck::prove(
                 settings.univariate_skips,

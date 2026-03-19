@@ -54,6 +54,7 @@ This branch documents and tracks GPU-focused optimization attempts for proving.
 - Baseline benchmark table for current CPU prover. Status: `benches/poseidon2_benchmarks.rs` now captures prover-only timings from the Poseidon2 example.
 - Feature-gated kernel abstraction for sumcheck compute path. Status: landed as a dispatch seam with CPU fallback in `crates/sumcheck/src/backend.rs`.
 - Witness-side batching helper for AIR prover. Status: landed as `crates/air/src/backend.rs`, including a smaller-domain combine path for `sub_evals` and `inner_sum`.
+- Feature-gated AIR hypercube evaluator based on compiled constraint IR. Status: landed for the outer zerocheck path under the `gpu` feature, via `sumcheck::prove_with_hypercube_evaluator` and `air::kernel_ir`.
 - First GPU implementation of hypercube reduction with parity tests against CPU.
 - Performance report: wall time, speedup, and memory transfer overhead.
 
@@ -73,7 +74,15 @@ This branch documents and tracks GPU-focused optimization attempts for proving.
 - Practical GPU targets remain the fold kernels and witness-side batching path; a real device implementation for hypercube reduction needs a serialized kernel IR or a computation-specific backend.
 - Progress: `air::kernel_ir` now compiles AIR constraints into a flat instruction program from Plonky3's symbolic builder, giving a concrete starting point for a computation-specific GPU backend.
 - Progress: that IR is now executable on CPU via `ConstraintProgram::evaluate`, so we can validate compiled constraint programs against the existing symbolic AIR path before introducing device kernels.
+- Progress: the zerocheck hot loop can now consume that compiled IR through a custom hypercube evaluator, but only when building with `--features gpu`.
+- Progress: the GPU-feature evaluator now runs against a lowered flat-input program layout, so the AIR kernel is represented as opcode stream plus input slots rather than repeated `KernelInput` decoding.
 - Validation: the Poseidon2 AIR remains a GPU-candidate subset (`148` constraints, `0` unsupported features), and the compiled program now matches the original symbolic constraints on generated trace rows.
+- Caveat: using the compiled IR interpreter as the default CPU prover path regressed the `2^16` Poseidon2 benchmark by about 25%, so the new evaluator is currently feature-gated while the host fallback is tuned or replaced with a real device backend.
+- Caveat: even after lowering to the flat-input plan, the `gpu`-feature host fallback still measured about `1.86s` at `log_n_rows = 16`, so further host-side interpreter work is unlikely to beat the existing callback path by itself.
+
+## Protocol Reference
+
+The end-to-end protocol walkthrough, concrete Poseidon2 worked example, and comparison with `/Users/miha/projects/csp/miha-whir-p3` now live in [`docs/whirlaway-protocol-walkthrough.md`](./whirlaway-protocol-walkthrough.md).
 
 ## Out of Scope (for now)
 

@@ -20,8 +20,67 @@ use crate::{
 
 pub const MIN_VARS_FOR_GPU: usize = 0; // When there are a small number of variables, it's not worth using GPU
 
+pub trait HypercubeEvaluator<F, NF, EF, SC>: Sync
+where
+    F: Field,
+    NF: ExtensionField<F>,
+    EF: ExtensionField<NF>,
+    SC: Sync,
+{
+    fn compute(
+        &self,
+        pols: &[EvaluationsList<NF>],
+        computation: &SC,
+        batching_scalars: &[EF],
+        eq_mle: Option<&EvaluationsList<EF>>,
+    ) -> EF;
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn prove<F, NF, EF, M, SC, Challenger>(
+    skips: usize, // skips == 1: classic sumcheck. skips >= 2: sumcheck with univariate skips (eprint 2024/108)
+    multilinears: &[M],
+    computation: &SC,
+    constraints_degree: usize,
+    batching_scalars: &[EF],
+    eq_factor: Option<&[EF]>,
+    is_zerofier: bool,
+    fs_prover: &mut ProverState<F, EF, Challenger>,
+    sum: EF,
+    n_rounds: Option<usize>,
+    grinding: SumcheckGrinding,
+    missing_mul_factor: Option<EF>,
+) -> (Vec<EF>, Vec<EvaluationsList<EF>>, EF)
+where
+    F: TwoAdicField,
+    NF: ExtensionField<F>,
+    EF: ExtensionField<NF> + ExtensionField<F> + TwoAdicField,
+    M: Borrow<EvaluationsList<NF>>,
+    SC: SumcheckComputation<F, NF, EF>
+        + SumcheckComputation<F, EF, EF>
+        + SumcheckComputationPacked<F, EF>,
+    Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F>,
+{
+    prove_with_hypercube_evaluator(
+        skips,
+        multilinears,
+        computation,
+        constraints_degree,
+        batching_scalars,
+        eq_factor,
+        is_zerofier,
+        fs_prover,
+        sum,
+        n_rounds,
+        grinding,
+        missing_mul_factor,
+        None,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prove_with_hypercube_evaluator<F, NF, EF, M, SC, Challenger>(
     skips: usize, // skips == 1: classic sumcheck. skips >= 2: sumcheck with univariate skips (eprint 2024/108)
     multilinears: &[M],
     computation: &SC,
@@ -34,6 +93,8 @@ pub fn prove<F, NF, EF, M, SC, Challenger>(
     n_rounds: Option<usize>,
     grinding: SumcheckGrinding,
     mut missing_mul_factor: Option<EF>,
+    base_hypercube_evaluator: Option<&dyn HypercubeEvaluator<F, NF, EF, SC>>,
+    extension_hypercube_evaluator: Option<&dyn HypercubeEvaluator<F, EF, EF, SC>>,
 ) -> (Vec<EF>, Vec<EvaluationsList<EF>>, EF)
 where
     F: TwoAdicField,
@@ -72,6 +133,7 @@ where
         &mut challenges,
         0,
         &mut missing_mul_factor,
+        base_hypercube_evaluator,
     );
     info!(
         round = 0,
@@ -97,6 +159,7 @@ where
             &mut challenges,
             i,
             &mut missing_mul_factor,
+            extension_hypercube_evaluator,
         );
         info!(
             round = i,
@@ -132,6 +195,7 @@ pub fn sc_round<F, NF, EF, SC, Challenger>(
     challenges: &mut Vec<EF>,
     round: usize,
     missing_mul_factor: &mut Option<EF>,
+    hypercube_evaluator: Option<&dyn HypercubeEvaluator<F, NF, EF, SC>>,
 ) -> Vec<EvaluationsList<EF>>
 where
     F: TwoAdicField,
@@ -197,8 +261,10 @@ where
                 batch_fold_multilinear_in_small_field(multilinears, &folding_scalars)
             };
 
-            let mut sum_z =
-                compute_over_hypercube(&folded, computation, batching_scalars, eq_mle.as_ref());
+            let mut sum_z = hypercube_evaluator.map_or_else(
+                || compute_over_hypercube(&folded, computation, batching_scalars, eq_mle.as_ref()),
+                |evaluator| evaluator.compute(&folded, computation, batching_scalars, eq_mle.as_ref()),
+            );
 
             if let Some(missing_mul_factor) = missing_mul_factor {
                 sum_z *= *missing_mul_factor;
