@@ -5,7 +5,7 @@ use p3_field::{
     BasedVectorSpace, ExtensionField, Field, PackedValue, PrimeCharacteristicRing, PrimeField32,
 };
 use p3_uni_stark::{
-    get_symbolic_constraints, Entry, SymbolicAirBuilder, SymbolicExpression, SymbolicVariable,
+    Entry, SymbolicAirBuilder, SymbolicExpression, SymbolicVariable, get_symbolic_constraints,
 };
 use smallvec::SmallVec;
 
@@ -980,11 +980,7 @@ impl CanonicalField32Config {
 
     #[must_use]
     pub fn neg(self, value: u32) -> u32 {
-        if value == 0 {
-            0
-        } else {
-            self.order - value
-        }
+        if value == 0 { 0 } else { self.order - value }
     }
 
     #[must_use]
@@ -1317,8 +1313,8 @@ fn push_unsupported(
 mod tests {
     use p3_air::{Air, AirBuilder, BaseAir};
     use p3_field::{
-        extension::BinomialExtensionField, BasedVectorSpace, ExtensionField, Field, PackedValue,
-        PrimeCharacteristicRing, PrimeField32,
+        BasedVectorSpace, ExtensionField, Field, PackedValue, PrimeCharacteristicRing,
+        PrimeField32, extension::BinomialExtensionField,
     };
     use p3_koala_bear::KoalaBear;
     use p3_matrix::Matrix;

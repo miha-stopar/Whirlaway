@@ -263,7 +263,9 @@ where
 
             let mut sum_z = hypercube_evaluator.map_or_else(
                 || compute_over_hypercube(&folded, computation, batching_scalars, eq_mle.as_ref()),
-                |evaluator| evaluator.compute(&folded, computation, batching_scalars, eq_mle.as_ref()),
+                |evaluator| {
+                    evaluator.compute(&folded, computation, batching_scalars, eq_mle.as_ref())
+                },
             );
 
             if let Some(missing_mul_factor) = missing_mul_factor {

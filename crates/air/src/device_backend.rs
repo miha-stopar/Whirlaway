@@ -1,3 +1,8 @@
+#[cfg(feature = "gpu")]
+use std::collections::hash_map::DefaultHasher;
+#[cfg(feature = "gpu")]
+use std::hash::{Hash, Hasher};
+
 use p3_field::{ExtensionField, Field, Packable};
 use whir_p3::poly::evals::EvaluationsList;
 
@@ -30,6 +35,7 @@ const MAX_EXTENSION_DEGREE: usize = 8;
 #[cfg(feature = "gpu")]
 pub(crate) fn evaluate_packed_main_pairs<F, EF>(
     program: &DeviceConstraintProgram<F>,
+    cached_program: Option<&PackedMainGpuProgram>,
     pols: &[EvaluationsList<F>],
     batching_scalars: &[EF],
     eq_mle: Option<&EvaluationsList<EF>>,
@@ -38,7 +44,7 @@ where
     F: Field + Packable + PrimeField32,
     EF: ExtensionField<F> + BasedVectorSpace<F>,
 {
-    dispatch::evaluate_packed_main_pairs(program, pols, batching_scalars, eq_mle)
+    dispatch::evaluate_packed_main_pairs(program, cached_program, pols, batching_scalars, eq_mle)
 }
 
 #[cfg(not(feature = "gpu"))]
@@ -84,9 +90,10 @@ mod cpu {
         F: Field + Packable,
         EF: ExtensionField<F>,
     {
-        assert!(pols
-            .iter()
-            .all(|p| p.num_variables() == pols[0].num_variables()));
+        assert!(
+            pols.iter()
+                .all(|p| p.num_variables() == pols[0].num_variables())
+        );
         assert!(
             pols.len().is_multiple_of(2),
             "compiled AIR evaluator expects local/next column pairs",
@@ -135,9 +142,10 @@ mod cpu {
         F: Field,
         EF: ExtensionField<F>,
     {
-        assert!(pols
-            .iter()
-            .all(|p| p.num_variables() == pols[0].num_variables()));
+        assert!(
+            pols.iter()
+                .all(|p| p.num_variables() == pols[0].num_variables())
+        );
         assert!(
             pols.len().is_multiple_of(2),
             "compiled AIR evaluator expects local/next column pairs",
@@ -182,7 +190,7 @@ pub(super) struct GpuKernelHeader {
 
 #[cfg(feature = "gpu")]
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+#[derive(Clone, Copy, Debug, Hash, Pod, Zeroable)]
 pub(super) struct GpuInstruction {
     pub(super) opcode: u32,
     pub(super) arg0: u32,
@@ -192,17 +200,47 @@ pub(super) struct GpuInstruction {
 
 #[cfg(feature = "gpu")]
 #[derive(Debug, Clone)]
-pub(super) struct PackedMainGpuPayload {
+pub(crate) struct PackedMainGpuProgram {
+    pub(crate) order: u32,
+    pub(crate) main_width: usize,
+    pub(crate) total_slots: usize,
+    pub(crate) instruction_count: u32,
+    pub(crate) output_count: u32,
+    pub(crate) extension_degree: u32,
+    pub(crate) instructions: Vec<GpuInstruction>,
+    pub(crate) constants: Vec<u32>,
+    pub(crate) outputs: Vec<u32>,
+    pub(crate) fingerprint: u64,
+}
+
+#[cfg(feature = "gpu")]
+#[derive(Debug, Clone)]
+pub(super) struct PackedMainGpuPayload<'a> {
+    pub(super) program: &'a PackedMainGpuProgram,
     pub(super) header: GpuKernelHeader,
-    pub(super) instructions: Vec<GpuInstruction>,
-    pub(super) constants: Vec<u32>,
-    pub(super) outputs: Vec<u32>,
     pub(super) batching_scalars: Vec<u32>,
     pub(super) flat_inputs: Vec<u32>,
 }
 
 #[cfg(feature = "gpu")]
-impl PackedMainGpuPayload {
+impl PackedMainGpuProgram {
+    #[must_use]
+    fn header_for_point_count(&self, point_count: usize) -> GpuKernelHeader {
+        GpuKernelHeader {
+            order: self.order,
+            point_count: point_count as u32,
+            total_slots: self.total_slots as u32,
+            instruction_count: self.instruction_count,
+            output_count: self.output_count,
+            extension_degree: self.extension_degree,
+            reserved0: 0,
+            reserved1: 0,
+        }
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl PackedMainGpuPayload<'_> {
     #[must_use]
     pub(super) fn result_len_u32s(&self) -> usize {
         self.header.point_count as usize * self.header.extension_degree as usize
@@ -236,23 +274,13 @@ impl GpuBackendPreference {
 }
 
 #[cfg(feature = "gpu")]
-fn build_packed_main_payload<F, EF>(
+pub(crate) fn build_packed_main_program<F, EF>(
     program: &DeviceConstraintProgram<F>,
-    pols: &[EvaluationsList<F>],
-    batching_scalars: &[EF],
-) -> Result<PackedMainGpuPayload, String>
+) -> Result<PackedMainGpuProgram, String>
 where
     F: Field + PrimeField32,
     EF: ExtensionField<F> + BasedVectorSpace<F>,
 {
-    assert!(pols
-        .iter()
-        .all(|p| p.num_variables() == pols[0].num_variables()));
-    assert!(
-        pols.len().is_multiple_of(2),
-        "compiled AIR evaluator expects local/next column pairs",
-    );
-
     let canonical = program.encode_canonical_u32();
     if canonical.opcodes.len() > MAX_DEVICE_OPCODES {
         return Err(format!(
@@ -268,28 +296,11 @@ where
     }
 
     let total_slots = canonical.input_layout.total_slots();
-    let width = pols.len() / 2;
-    let expected_main_only_slots = width * 2 + 3;
+    let expected_main_only_slots = canonical.input_layout.main_width * 2 + 3;
     if total_slots != expected_main_only_slots {
         return Err(format!(
             "device runtime only supports main-column AIR inputs; expected {expected_main_only_slots} flat slots, got {total_slots}",
         ));
-    }
-
-    let point_count = pols[0].num_evals();
-    let mut flat_inputs = Vec::with_capacity(point_count * total_slots);
-    for point_idx in 0..point_count {
-        flat_inputs.extend(
-            pols[..width]
-                .iter()
-                .map(|poly| poly.evals()[point_idx].as_canonical_u32()),
-        );
-        flat_inputs.extend(
-            pols[width..]
-                .iter()
-                .map(|poly| poly.evals()[point_idx].as_canonical_u32()),
-        );
-        flat_inputs.extend_from_slice(&[0, 0, 0]);
     }
 
     let instructions = canonical
@@ -305,20 +316,77 @@ where
         })
         .collect::<Vec<_>>();
 
-    Ok(PackedMainGpuPayload {
-        header: GpuKernelHeader {
-            order: canonical.field.order,
-            point_count: point_count as u32,
-            total_slots: total_slots as u32,
-            instruction_count: canonical.opcodes.len() as u32,
-            output_count: canonical.outputs.len() as u32,
-            extension_degree: EF::DIMENSION as u32,
-            reserved0: 0,
-            reserved1: 0,
-        },
+    let mut hasher = DefaultHasher::new();
+    canonical.field.order.hash(&mut hasher);
+    canonical.input_layout.main_width.hash(&mut hasher);
+    total_slots.hash(&mut hasher);
+    canonical.opcodes.len().hash(&mut hasher);
+    canonical.outputs.len().hash(&mut hasher);
+    EF::DIMENSION.hash(&mut hasher);
+    instructions.hash(&mut hasher);
+    canonical.constants.hash(&mut hasher);
+    canonical.outputs.hash(&mut hasher);
+
+    Ok(PackedMainGpuProgram {
+        order: canonical.field.order,
+        main_width: canonical.input_layout.main_width,
+        total_slots,
+        instruction_count: canonical.opcodes.len() as u32,
+        output_count: canonical.outputs.len() as u32,
+        extension_degree: EF::DIMENSION as u32,
         instructions,
         constants: canonical.constants,
         outputs: canonical.outputs,
+        fingerprint: hasher.finish(),
+    })
+}
+
+#[cfg(feature = "gpu")]
+fn build_packed_main_payload<'a, F, EF>(
+    program: &'a PackedMainGpuProgram,
+    pols: &[EvaluationsList<F>],
+    batching_scalars: &[EF],
+) -> Result<PackedMainGpuPayload<'a>, String>
+where
+    F: Field + PrimeField32,
+    EF: ExtensionField<F> + BasedVectorSpace<F>,
+{
+    assert!(
+        pols.iter()
+            .all(|p| p.num_variables() == pols[0].num_variables())
+    );
+    assert!(
+        pols.len().is_multiple_of(2),
+        "compiled AIR evaluator expects local/next column pairs",
+    );
+
+    let width = pols.len() / 2;
+    if width != program.main_width {
+        return Err(format!(
+            "device runtime expected {} local/next column pairs, got {width}",
+            program.main_width,
+        ));
+    }
+
+    let point_count = pols[0].num_evals();
+    let mut flat_inputs = Vec::with_capacity(point_count * program.total_slots);
+    for point_idx in 0..point_count {
+        flat_inputs.extend(
+            pols[..width]
+                .iter()
+                .map(|poly| poly.evals()[point_idx].as_canonical_u32()),
+        );
+        flat_inputs.extend(
+            pols[width..]
+                .iter()
+                .map(|poly| poly.evals()[point_idx].as_canonical_u32()),
+        );
+        flat_inputs.extend_from_slice(&[0, 0, 0]);
+    }
+
+    Ok(PackedMainGpuPayload {
+        program,
+        header: program.header_for_point_count(point_count),
         batching_scalars: encode_canonical_basis_u32::<F, EF>(batching_scalars),
         flat_inputs,
     })
@@ -356,7 +424,7 @@ where
 }
 
 #[cfg(feature = "gpu")]
-fn execute_packed_main_payload(payload: &PackedMainGpuPayload) -> Result<Vec<u32>, String> {
+fn execute_packed_main_payload(payload: &PackedMainGpuPayload<'_>) -> Result<Vec<u32>, String> {
     match GpuBackendPreference::from_env() {
         GpuBackendPreference::Auto => execute_packed_main_auto(payload),
         GpuBackendPreference::Metal => execute_packed_main_metal(payload),
@@ -365,7 +433,7 @@ fn execute_packed_main_payload(payload: &PackedMainGpuPayload) -> Result<Vec<u32
 }
 
 #[cfg(feature = "gpu")]
-fn execute_packed_main_auto(payload: &PackedMainGpuPayload) -> Result<Vec<u32>, String> {
+fn execute_packed_main_auto(payload: &PackedMainGpuPayload<'_>) -> Result<Vec<u32>, String> {
     let mut errors = Vec::new();
 
     #[cfg(target_os = "macos")]
@@ -384,7 +452,7 @@ fn execute_packed_main_auto(payload: &PackedMainGpuPayload) -> Result<Vec<u32>, 
 }
 
 #[cfg(feature = "gpu")]
-fn execute_packed_main_metal(payload: &PackedMainGpuPayload) -> Result<Vec<u32>, String> {
+fn execute_packed_main_metal(payload: &PackedMainGpuPayload<'_>) -> Result<Vec<u32>, String> {
     #[cfg(target_os = "macos")]
     {
         metal_backend::execute(payload)
@@ -403,6 +471,7 @@ mod gpu {
 
     pub(super) fn evaluate_packed_main_pairs<F, EF>(
         program: &DeviceConstraintProgram<F>,
+        cached_program: Option<&PackedMainGpuProgram>,
         pols: &[EvaluationsList<F>],
         batching_scalars: &[EF],
         eq_mle: Option<&EvaluationsList<EF>>,
@@ -411,7 +480,12 @@ mod gpu {
         F: Field + Packable + PrimeField32,
         EF: ExtensionField<F> + BasedVectorSpace<F>,
     {
-        let payload = match build_packed_main_payload(program, pols, batching_scalars) {
+        let Some(cached_program) = cached_program else {
+            warn!("gpu static payload unavailable; falling back to cpu");
+            return cpu::evaluate_packed_main_pairs(program, pols, batching_scalars, eq_mle);
+        };
+
+        let payload = match build_packed_main_payload(cached_program, pols, batching_scalars) {
             Ok(payload) => payload,
             Err(err) => {
                 warn!(reason = %err, "gpu payload build failed; falling back to cpu");
@@ -454,6 +528,7 @@ mod dispatch {
 
     pub(super) fn evaluate_packed_main_pairs<F, EF>(
         program: &DeviceConstraintProgram<F>,
+        cached_program: Option<&PackedMainGpuProgram>,
         pols: &[EvaluationsList<F>],
         batching_scalars: &[EF],
         eq_mle: Option<&EvaluationsList<EF>>,
@@ -463,7 +538,7 @@ mod dispatch {
         EF: ExtensionField<F> + BasedVectorSpace<F>,
     {
         if should_use_gpu(pols.first().map_or(0, EvaluationsList::num_evals)) {
-            gpu::evaluate_packed_main_pairs(program, pols, batching_scalars, eq_mle)
+            gpu::evaluate_packed_main_pairs(program, cached_program, pols, batching_scalars, eq_mle)
         } else {
             cpu::evaluate_packed_main_pairs(program, pols, batching_scalars, eq_mle)
         }
@@ -493,6 +568,7 @@ mod dispatch {
 
     pub(super) fn evaluate_packed_main_pairs<F, EF>(
         program: &DeviceConstraintProgram<F>,
+        _cached_program: Option<&PackedMainGpuProgram>,
         pols: &[EvaluationsList<F>],
         batching_scalars: &[EF],
         eq_mle: Option<&EvaluationsList<EF>>,

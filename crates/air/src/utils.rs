@@ -7,7 +7,7 @@ use whir_p3::{
     poly::{evals::EvaluationsList, multilinear::MultilinearPoint},
 };
 
-use crate::{table::AirTable, AirSettings};
+use crate::{AirSettings, table::AirTable};
 
 pub(crate) fn matrix_up_lde<F: Field>(point: &[F]) -> F {
     /*

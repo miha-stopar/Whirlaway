@@ -10,9 +10,9 @@ use sumcheck::HypercubeEvaluator;
 
 #[cfg(feature = "gpu")]
 use crate::device_backend;
-#[cfg(feature = "gpu")]
-use crate::kernel_ir::DeviceConstraintProgram;
 use crate::utils::{column_down, column_up};
+#[cfg(feature = "gpu")]
+use crate::{device_backend::PackedMainGpuProgram, kernel_ir::DeviceConstraintProgram};
 
 pub(crate) struct BatchedWitness<EF> {
     pub(crate) batched_column: EvaluationsList<EF>,
@@ -23,13 +23,21 @@ pub(crate) struct BatchedWitness<EF> {
 #[cfg(feature = "gpu")]
 pub(crate) struct ConstraintProgramHypercubeEvaluator<'a, F> {
     program: &'a DeviceConstraintProgram<F>,
+    packed_main_program: Option<PackedMainGpuProgram>,
 }
 
 #[cfg(feature = "gpu")]
 impl<'a, F> ConstraintProgramHypercubeEvaluator<'a, F> {
     #[must_use]
-    pub(crate) const fn new(program: &'a DeviceConstraintProgram<F>) -> Self {
-        Self { program }
+    pub(crate) fn new<EF>(program: &'a DeviceConstraintProgram<F>) -> Self
+    where
+        F: Field + PrimeField32,
+        EF: ExtensionField<F> + BasedVectorSpace<F>,
+    {
+        Self {
+            program,
+            packed_main_program: device_backend::build_packed_main_program::<F, EF>(program).ok(),
+        }
     }
 }
 
@@ -60,7 +68,13 @@ where
         batching_scalars: &[EF],
         eq_mle: Option<&EvaluationsList<EF>>,
     ) -> EF {
-        device_backend::evaluate_packed_main_pairs(self.program, pols, batching_scalars, eq_mle)
+        device_backend::evaluate_packed_main_pairs(
+            self.program,
+            self.packed_main_program.as_ref(),
+            pols,
+            batching_scalars,
+            eq_mle,
+        )
     }
 }
 
@@ -216,16 +230,16 @@ mod dispatch {
 mod tests {
     #[cfg(feature = "gpu")]
     use p3_air::{Air, AirBuilder, BaseAir};
-    use p3_field::extension::BinomialExtensionField;
     #[cfg(feature = "gpu")]
     use p3_field::PrimeCharacteristicRing;
+    use p3_field::extension::BinomialExtensionField;
     use p3_koala_bear::KoalaBear;
     #[cfg(feature = "gpu")]
     use p3_matrix::Matrix;
 
     use super::*;
     #[cfg(feature = "gpu")]
-    use crate::kernel_ir::{compile_air_constraint_program, ConstraintProgramInputs};
+    use crate::kernel_ir::{ConstraintProgramInputs, compile_air_constraint_program};
 
     type F = KoalaBear;
     type EF = BinomialExtensionField<F, 8>;
@@ -312,7 +326,7 @@ mod tests {
         let program = compile_air_constraint_program::<F, _>(&ArithmeticAir, 0, 0);
         let lowered_program = program.lower();
         let device_program = lowered_program.encode_for_device();
-        let evaluator = ConstraintProgramHypercubeEvaluator::new(&device_program);
+        let evaluator = ConstraintProgramHypercubeEvaluator::new::<EF>(&device_program);
         let pols = vec![
             base_poly(&[2, 3, 4, 5]),
             base_poly(&[6, 7, 8, 9]),

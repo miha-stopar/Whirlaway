@@ -1,4 +1,4 @@
-use std::sync::mpsc;
+use std::sync::{Mutex, MutexGuard, OnceLock, mpsc};
 
 use bytemuck::cast_slice;
 use pollster::block_on;
@@ -7,6 +7,119 @@ use wgpu::util::DeviceExt;
 use super::PackedMainGpuPayload;
 
 const WORKGROUP_SIZE: u32 = 64;
+
+struct WgpuRuntime {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    pipeline: wgpu::ComputePipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    program_buffers: Mutex<Option<WgpuProgramBuffers>>,
+}
+
+struct WgpuProgramBuffers {
+    fingerprint: u64,
+    instruction_buffer: wgpu::Buffer,
+    constants_buffer: wgpu::Buffer,
+    outputs_buffer: wgpu::Buffer,
+}
+
+fn runtime() -> Result<&'static WgpuRuntime, String> {
+    static RUNTIME: OnceLock<Result<WgpuRuntime, String>> = OnceLock::new();
+
+    match RUNTIME.get_or_init(init_runtime) {
+        Ok(runtime) => Ok(runtime),
+        Err(err) => Err(err.clone()),
+    }
+}
+
+fn init_runtime() -> Result<WgpuRuntime, String> {
+    let instance = wgpu::Instance::default();
+    let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        force_fallback_adapter: false,
+        compatible_surface: None,
+    }))
+    .ok_or("request_adapter returned no compatible device")?;
+
+    let (device, queue) = block_on(adapter.request_device(
+        &wgpu::DeviceDescriptor {
+            label: Some("whirlaway-air-wgpu-device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            memory_hints: wgpu::MemoryHints::Performance,
+        },
+        None,
+    ))
+    .map_err(|err| format!("request_device failed: {err}"))?;
+
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("whirlaway-air-wgpu-shader"),
+        source: wgpu::ShaderSource::Wgsl(WGSL_SOURCE.into()),
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("whirlaway-air-wgpu-pipeline"),
+        layout: None,
+        module: &shader,
+        entry_point: Some("evaluate_air"),
+        compilation_options: wgpu::PipelineCompilationOptions::default(),
+        cache: None,
+    });
+    let bind_group_layout = pipeline.get_bind_group_layout(0);
+
+    Ok(WgpuRuntime {
+        device,
+        queue,
+        pipeline,
+        bind_group_layout,
+        program_buffers: Mutex::new(None),
+    })
+}
+
+fn static_program_buffers<'a>(
+    runtime: &'a WgpuRuntime,
+    payload: &PackedMainGpuPayload<'_>,
+) -> MutexGuard<'a, Option<WgpuProgramBuffers>> {
+    let mut cached = runtime
+        .program_buffers
+        .lock()
+        .expect("wgpu program buffer cache should not be poisoned");
+
+    if cached
+        .as_ref()
+        .is_none_or(|buffers| buffers.fingerprint != payload.program.fingerprint)
+    {
+        let device = &runtime.device;
+        let instruction_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("whirlaway-air-wgpu-instructions"),
+            contents: cast_slice(payload.program.instructions.as_slice()),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let constants_data = if payload.program.constants.is_empty() {
+            &[0u32][..]
+        } else {
+            payload.program.constants.as_slice()
+        };
+        let constants_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("whirlaway-air-wgpu-constants"),
+            contents: cast_slice(constants_data),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let outputs_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("whirlaway-air-wgpu-outputs"),
+            contents: cast_slice(payload.program.outputs.as_slice()),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+
+        *cached = Some(WgpuProgramBuffers {
+            fingerprint: payload.program.fingerprint,
+            instruction_buffer,
+            constants_buffer,
+            outputs_buffer,
+        });
+    }
+
+    cached
+}
 
 const WGSL_SOURCE: &str = r#"
 struct Header {
@@ -148,63 +261,19 @@ fn evaluate_air(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
-pub(super) fn execute(payload: &PackedMainGpuPayload) -> Result<Vec<u32>, String> {
-    let instance = wgpu::Instance::default();
-    let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-        power_preference: wgpu::PowerPreference::HighPerformance,
-        force_fallback_adapter: false,
-        compatible_surface: None,
-    }))
-    .ok_or("request_adapter returned no compatible device")?;
-
-    let (device, queue) = block_on(adapter.request_device(
-        &wgpu::DeviceDescriptor {
-            label: Some("whirlaway-air-wgpu-device"),
-            required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::default(),
-            memory_hints: wgpu::MemoryHints::Performance,
-        },
-        None,
-    ))
-    .map_err(|err| format!("request_device failed: {err}"))?;
-
-    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("whirlaway-air-wgpu-shader"),
-        source: wgpu::ShaderSource::Wgsl(WGSL_SOURCE.into()),
-    });
-    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some("whirlaway-air-wgpu-pipeline"),
-        layout: None,
-        module: &shader,
-        entry_point: Some("evaluate_air"),
-        compilation_options: wgpu::PipelineCompilationOptions::default(),
-        cache: None,
-    });
+pub(super) fn execute(payload: &PackedMainGpuPayload<'_>) -> Result<Vec<u32>, String> {
+    let runtime = runtime()?;
+    let device = &runtime.device;
+    let queue = &runtime.queue;
+    let program_buffers = static_program_buffers(runtime, payload);
+    let program_buffers = program_buffers
+        .as_ref()
+        .expect("wgpu program buffers should be initialized");
 
     let header_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("whirlaway-air-wgpu-header"),
         contents: cast_slice(std::slice::from_ref(&payload.header)),
         usage: wgpu::BufferUsages::UNIFORM,
-    });
-    let instruction_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("whirlaway-air-wgpu-instructions"),
-        contents: cast_slice(&payload.instructions),
-        usage: wgpu::BufferUsages::STORAGE,
-    });
-    let constants_data = if payload.constants.is_empty() {
-        &[0u32][..]
-    } else {
-        payload.constants.as_slice()
-    };
-    let constants_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("whirlaway-air-wgpu-constants"),
-        contents: cast_slice(constants_data),
-        usage: wgpu::BufferUsages::STORAGE,
-    });
-    let outputs_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("whirlaway-air-wgpu-outputs"),
-        contents: cast_slice(&payload.outputs),
-        usage: wgpu::BufferUsages::STORAGE,
     });
     let batching_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("whirlaway-air-wgpu-batching"),
@@ -232,7 +301,7 @@ pub(super) fn execute(payload: &PackedMainGpuPayload) -> Result<Vec<u32>, String
 
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("whirlaway-air-wgpu-bind-group"),
-        layout: &pipeline.get_bind_group_layout(0),
+        layout: &runtime.bind_group_layout,
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
@@ -240,15 +309,15 @@ pub(super) fn execute(payload: &PackedMainGpuPayload) -> Result<Vec<u32>, String
             },
             wgpu::BindGroupEntry {
                 binding: 1,
-                resource: instruction_buffer.as_entire_binding(),
+                resource: program_buffers.instruction_buffer.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
                 binding: 2,
-                resource: constants_buffer.as_entire_binding(),
+                resource: program_buffers.constants_buffer.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
                 binding: 3,
-                resource: outputs_buffer.as_entire_binding(),
+                resource: program_buffers.outputs_buffer.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
                 binding: 4,
@@ -273,7 +342,7 @@ pub(super) fn execute(payload: &PackedMainGpuPayload) -> Result<Vec<u32>, String
             label: Some("whirlaway-air-wgpu-pass"),
             timestamp_writes: None,
         });
-        pass.set_pipeline(&pipeline);
+        pass.set_pipeline(&runtime.pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
         let workgroups = payload.header.point_count.div_ceil(WORKGROUP_SIZE);
         pass.dispatch_workgroups(workgroups, 1, 1);

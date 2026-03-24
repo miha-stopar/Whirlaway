@@ -1,8 +1,8 @@
 use p3_air::Air;
 use p3_challenger::{FieldChallenger, GrindingChallenger};
 use p3_field::{
-    cyclic_subgroup_known_order, BasedVectorSpace, ExtensionField, Field, Packable, PrimeField32,
-    TwoAdicField,
+    BasedVectorSpace, ExtensionField, Field, Packable, PrimeField32, TwoAdicField,
+    cyclic_subgroup_known_order,
 };
 use p3_symmetric::{CryptographicHasher, PseudoCompressionFunction};
 use p3_uni_stark::SymbolicAirBuilder;
@@ -10,8 +10,8 @@ use p3_util::log2_strict_usize;
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
 use sumcheck::{SumcheckComputation, SumcheckComputationPacked, SumcheckGrinding};
-use tracing::{info, info_span, instrument, span, Level};
-use utils::{add_multilinears, packed_multilinear, ConstraintFolder, ConstraintFolderPacked};
+use tracing::{Level, info, info_span, instrument, span};
+use utils::{ConstraintFolder, ConstraintFolderPacked, add_multilinears, packed_multilinear};
 use whir_p3::{
     dft::EvalsDft,
     fiat_shamir::prover::ProverState,
@@ -19,15 +19,15 @@ use whir_p3::{
     whir::{
         committer::writer::CommitmentWriter,
         prover::Prover,
-        statement::{weights::Weights, Statement},
+        statement::{Statement, weights::Weights},
     },
 };
 
 use crate::{
+    AirSettings,
     backend::prepare_batched_witness,
     uni_skip_utils::{matrix_down_folded, matrix_up_folded},
     utils::columns_up_and_down,
-    AirSettings,
 };
 
 #[cfg(feature = "gpu")]
@@ -136,7 +136,7 @@ where
             let compiled_base_hypercube_evaluator = self
                 .device_constraint_program
                 .as_ref()
-                .map(ConstraintProgramHypercubeEvaluator::new);
+                .map(ConstraintProgramHypercubeEvaluator::new::<EF>);
             let compiled_extension_hypercube_evaluator = self
                 .device_constraint_program
                 .as_ref()

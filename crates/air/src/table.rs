@@ -2,9 +2,9 @@ use p3_air::Air;
 use p3_challenger::{FieldChallenger, GrindingChallenger};
 use p3_field::{ExtensionField, Field, TwoAdicField};
 
+use p3_uni_stark::SymbolicAirBuilder;
 #[cfg(not(feature = "gpu"))]
 use p3_uni_stark::get_symbolic_constraints;
-use p3_uni_stark::SymbolicAirBuilder;
 use utils::{log2_up, univariate_selectors};
 use whir_p3::{
     parameters::{MultivariateParameters, ProtocolParameters},
@@ -13,7 +13,7 @@ use whir_p3::{
 };
 
 #[cfg(feature = "gpu")]
-use crate::kernel_ir::{compile_air_constraint_program, DeviceConstraintProgram};
+use crate::kernel_ir::{DeviceConstraintProgram, compile_air_constraint_program};
 use crate::{AirSettings, WHIR_POW_BITS};
 
 pub struct AirTable<F: Field, EF, A> {
