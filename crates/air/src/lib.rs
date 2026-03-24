@@ -1,6 +1,14 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
+use bytemuck as _;
+#[cfg(target_os = "macos")]
+use metal as _;
+use pollster as _;
+use wgpu as _;
+
 mod backend;
+#[cfg(feature = "gpu")]
+mod device_backend;
 pub mod kernel_ir;
 mod prove;
 pub mod table;
@@ -10,7 +18,7 @@ mod verify;
 
 const WHIR_POW_BITS: usize = 16;
 
-use whir_p3::parameters::{FoldingFactor, errors::SecurityAssumption};
+use whir_p3::parameters::{errors::SecurityAssumption, FoldingFactor};
 
 #[derive(Clone, Debug)]
 pub struct AirSettings {

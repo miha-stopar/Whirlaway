@@ -1,16 +1,17 @@
 use p3_air::Air;
 use p3_challenger::{FieldChallenger, GrindingChallenger};
 use p3_field::{
-    BasedVectorSpace, ExtensionField, Field, Packable, TwoAdicField, cyclic_subgroup_known_order,
+    cyclic_subgroup_known_order, BasedVectorSpace, ExtensionField, Field, Packable, PrimeField32,
+    TwoAdicField,
 };
-use p3_uni_stark::SymbolicAirBuilder;
 use p3_symmetric::{CryptographicHasher, PseudoCompressionFunction};
+use p3_uni_stark::SymbolicAirBuilder;
 use p3_util::log2_strict_usize;
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
 use sumcheck::{SumcheckComputation, SumcheckComputationPacked, SumcheckGrinding};
-use tracing::{Level, info, info_span, instrument, span};
-use utils::{ConstraintFolder, ConstraintFolderPacked, add_multilinears, packed_multilinear};
+use tracing::{info, info_span, instrument, span, Level};
+use utils::{add_multilinears, packed_multilinear, ConstraintFolder, ConstraintFolderPacked};
 use whir_p3::{
     dft::EvalsDft,
     fiat_shamir::prover::ProverState,
@@ -18,23 +19,20 @@ use whir_p3::{
     whir::{
         committer::writer::CommitmentWriter,
         prover::Prover,
-        statement::{Statement, weights::Weights},
+        statement::{weights::Weights, Statement},
     },
 };
 
 use crate::{
-    AirSettings,
     backend::prepare_batched_witness,
     uni_skip_utils::{matrix_down_folded, matrix_up_folded},
     utils::columns_up_and_down,
+    AirSettings,
 };
 
 #[cfg(feature = "gpu")]
-use crate::{
-    backend::{
-        ConstraintProgramExtensionHypercubeEvaluator, ConstraintProgramHypercubeEvaluator,
-    },
-    kernel_ir::compile_air_constraint_program,
+use crate::backend::{
+    ConstraintProgramExtensionHypercubeEvaluator, ConstraintProgramHypercubeEvaluator,
 };
 
 use super::table::AirTable;
@@ -47,8 +45,8 @@ cf https://eprint.iacr.org/2023/552.pdf and https://solvable.group/posts/super-a
 
 impl<F, EF, A> AirTable<F, EF, A>
 where
-    F: TwoAdicField,
-    EF: ExtensionField<F> + TwoAdicField,
+    F: TwoAdicField + PrimeField32,
+    EF: ExtensionField<F> + TwoAdicField + BasedVectorSpace<F>,
     A: Air<SymbolicAirBuilder<F>>,
     A: for<'a> Air<ConstraintFolder<'a, F, F, EF>>
         + for<'a> Air<ConstraintFolder<'a, F, EF, EF>>
@@ -135,16 +133,14 @@ where
         let zerocheck_start = Instant::now();
         #[cfg(feature = "gpu")]
         let (zerocheck_challenges, all_inner_sums, _) = info_span!("zerocheck").in_scope(|| {
-            let constraint_program = compile_air_constraint_program::<F, _>(&self.air, 0, 0);
-            let lowered_constraint_program = constraint_program.lower();
-            let compiled_base_hypercube_evaluator = constraint_program
-                .is_gpu_candidate()
-                .then(|| ConstraintProgramHypercubeEvaluator::new(&lowered_constraint_program));
-            let compiled_extension_hypercube_evaluator = constraint_program
-                .is_gpu_candidate()
-                .then(|| {
-                    ConstraintProgramExtensionHypercubeEvaluator::new(&lowered_constraint_program)
-                });
+            let compiled_base_hypercube_evaluator = self
+                .device_constraint_program
+                .as_ref()
+                .map(ConstraintProgramHypercubeEvaluator::new);
+            let compiled_extension_hypercube_evaluator = self
+                .device_constraint_program
+                .as_ref()
+                .map(ConstraintProgramExtensionHypercubeEvaluator::new);
 
             sumcheck::prove_with_hypercube_evaluator(
                 settings.univariate_skips,

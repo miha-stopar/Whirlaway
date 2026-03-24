@@ -1,10 +1,17 @@
 use std::collections::HashMap;
 
 use p3_air::Air;
-use p3_field::{ExtensionField, Field, PackedValue, PrimeCharacteristicRing};
-use p3_uni_stark::{
-    Entry, SymbolicAirBuilder, SymbolicExpression, SymbolicVariable, get_symbolic_constraints,
+use p3_field::{
+    BasedVectorSpace, ExtensionField, Field, PackedValue, PrimeCharacteristicRing, PrimeField32,
 };
+use p3_uni_stark::{
+    get_symbolic_constraints, Entry, SymbolicAirBuilder, SymbolicExpression, SymbolicVariable,
+};
+use smallvec::SmallVec;
+
+const INLINE_INPUT_SLOTS: usize = 64;
+
+pub type FlatInputBuffer<T> = SmallVec<[T; INLINE_INPUT_SLOTS]>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RowSelector {
@@ -124,6 +131,53 @@ pub struct LoweredConstraintProgram<F> {
     pub max_constraint_degree: usize,
 }
 
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KernelOpcode {
+    Constant = 0,
+    Input = 1,
+    Add = 2,
+    Sub = 3,
+    Neg = 4,
+    Mul = 5,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeviceConstraintProgram<F> {
+    pub input_layout: ConstraintInputLayout,
+    pub constants: Vec<F>,
+    pub opcodes: Vec<KernelOpcode>,
+    pub arg0: Vec<u32>,
+    pub arg1: Vec<u32>,
+    pub outputs: Vec<u32>,
+    pub unsupported_features: Vec<UnsupportedGpuFeature>,
+    pub max_constraint_degree: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CanonicalField32Config {
+    pub order: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CanonicalBinomialExtensionField32 {
+    pub degree: usize,
+    pub w: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalDeviceConstraintProgram32 {
+    pub field: CanonicalField32Config,
+    pub input_layout: ConstraintInputLayout,
+    pub constants: Vec<u32>,
+    pub opcodes: Vec<KernelOpcode>,
+    pub arg0: Vec<u32>,
+    pub arg1: Vec<u32>,
+    pub outputs: Vec<u32>,
+    pub unsupported_features: Vec<UnsupportedGpuFeature>,
+    pub max_constraint_degree: usize,
+}
+
 impl<F> ConstraintProgram<F> {
     #[must_use]
     pub fn is_gpu_candidate(&self) -> bool {
@@ -233,10 +287,23 @@ impl ConstraintInputLayout {
     }
 
     #[must_use]
-    pub fn flatten_inputs<T: Copy>(&self, inputs: &ConstraintProgramInputs<'_, T>) -> Vec<T> {
-        let mut flat_inputs = Vec::with_capacity(self.total_slots());
-        self.push_slice(&mut flat_inputs, inputs.main.local, self.main_width, "main local");
-        self.push_slice(&mut flat_inputs, inputs.main.next, self.main_width, "main next");
+    pub fn flatten_inputs<T: Copy>(
+        &self,
+        inputs: &ConstraintProgramInputs<'_, T>,
+    ) -> FlatInputBuffer<T> {
+        let mut flat_inputs = FlatInputBuffer::with_capacity(self.total_slots());
+        self.push_slice(
+            &mut flat_inputs,
+            inputs.main.local,
+            self.main_width,
+            "main local",
+        );
+        self.push_slice(
+            &mut flat_inputs,
+            inputs.main.next,
+            self.main_width,
+            "main next",
+        );
         self.push_slice(
             &mut flat_inputs,
             inputs.preprocessed.local,
@@ -279,9 +346,33 @@ impl ConstraintInputLayout {
         flat_inputs
     }
 
+    #[must_use]
+    pub fn flatten_main_pair<T: Copy>(
+        &self,
+        local: &[T],
+        next: &[T],
+        is_first_row: T,
+        is_last_row: T,
+        is_transition: T,
+    ) -> FlatInputBuffer<T> {
+        assert_eq!(
+            self.preprocessed_width + self.permutation_width + self.public_values + self.challenges,
+            0,
+            "flatten_main_pair only supports main-column AIR inputs",
+        );
+
+        let mut flat_inputs = FlatInputBuffer::with_capacity(self.total_slots());
+        self.push_slice(&mut flat_inputs, local, self.main_width, "main local");
+        self.push_slice(&mut flat_inputs, next, self.main_width, "main next");
+        flat_inputs.push(is_first_row);
+        flat_inputs.push(is_last_row);
+        flat_inputs.push(is_transition);
+        flat_inputs
+    }
+
     fn push_slice<T: Copy>(
         &self,
-        flat_inputs: &mut Vec<T>,
+        flat_inputs: &mut FlatInputBuffer<T>,
         values: &[T],
         width: usize,
         label: &str,
@@ -590,17 +681,72 @@ impl<F: Field> ConstraintProgram<F> {
             values.push(value);
         }
 
-        self.outputs
-            .iter()
-            .zip(batching_scalars)
-            .fold(EF::ExtensionPacking::ZERO, |acc, (&output, &alpha)| {
+        self.outputs.iter().zip(batching_scalars).fold(
+            EF::ExtensionPacking::ZERO,
+            |acc, (&output, &alpha)| {
                 acc + Into::<EF::ExtensionPacking>::into(alpha)
                     * Into::<EF::ExtensionPacking>::into(values[output])
-            })
+            },
+        )
     }
 }
 
 impl<F: Field> LoweredConstraintProgram<F> {
+    #[must_use]
+    pub fn encode_for_device(&self) -> DeviceConstraintProgram<F> {
+        let mut constants = Vec::new();
+        let mut opcodes = Vec::with_capacity(self.instructions.len());
+        let mut arg0 = Vec::with_capacity(self.instructions.len());
+        let mut arg1 = Vec::with_capacity(self.instructions.len());
+
+        for instruction in &self.instructions {
+            match instruction {
+                LoweredKernelInstruction::Constant(value) => {
+                    opcodes.push(KernelOpcode::Constant);
+                    arg0.push(constants.len() as u32);
+                    arg1.push(0);
+                    constants.push(*value);
+                }
+                LoweredKernelInstruction::Input { slot } => {
+                    opcodes.push(KernelOpcode::Input);
+                    arg0.push(*slot as u32);
+                    arg1.push(0);
+                }
+                LoweredKernelInstruction::Add { lhs, rhs } => {
+                    opcodes.push(KernelOpcode::Add);
+                    arg0.push(*lhs as u32);
+                    arg1.push(*rhs as u32);
+                }
+                LoweredKernelInstruction::Sub { lhs, rhs } => {
+                    opcodes.push(KernelOpcode::Sub);
+                    arg0.push(*lhs as u32);
+                    arg1.push(*rhs as u32);
+                }
+                LoweredKernelInstruction::Neg { src } => {
+                    opcodes.push(KernelOpcode::Neg);
+                    arg0.push(*src as u32);
+                    arg1.push(0);
+                }
+                LoweredKernelInstruction::Mul { lhs, rhs } => {
+                    opcodes.push(KernelOpcode::Mul);
+                    arg0.push(*lhs as u32);
+                    arg1.push(*rhs as u32);
+                }
+            }
+        }
+
+        DeviceConstraintProgram {
+            input_layout: self.input_layout,
+            constants,
+            opcodes,
+            arg0,
+            arg1,
+            outputs: self.outputs.iter().map(|&output| output as u32).collect(),
+            unsupported_features: self.unsupported_features.clone(),
+            max_constraint_degree: self.max_constraint_degree,
+        }
+    }
+
     #[must_use]
     pub fn evaluate_batched<EF>(&self, flat_inputs: &[F], batching_scalars: &[EF]) -> EF
     where
@@ -687,14 +833,338 @@ impl<F: Field> LoweredConstraintProgram<F> {
             values.push(value);
         }
 
+        self.outputs.iter().zip(batching_scalars).fold(
+            EF::ExtensionPacking::ZERO,
+            |acc, (&output, &alpha)| {
+                acc + Into::<EF::ExtensionPacking>::into(alpha)
+                    * Into::<EF::ExtensionPacking>::into(values[output])
+            },
+        )
+    }
+}
+
+impl<F: Field> DeviceConstraintProgram<F> {
+    #[must_use]
+    pub fn evaluate_batched<EF>(&self, flat_inputs: &[F], batching_scalars: &[EF]) -> EF
+    where
+        EF: ExtensionField<F>,
+    {
+        self.evaluate_batched_in_extension(flat_inputs, batching_scalars)
+    }
+
+    #[must_use]
+    pub fn evaluate_batched_in_extension<NF, EF>(
+        &self,
+        flat_inputs: &[NF],
+        batching_scalars: &[EF],
+    ) -> EF
+    where
+        NF: ExtensionField<F>,
+        EF: ExtensionField<NF>,
+    {
+        assert_eq!(self.opcodes.len(), self.arg0.len());
+        assert_eq!(self.opcodes.len(), self.arg1.len());
+        assert_eq!(
+            self.outputs.len(),
+            batching_scalars.len(),
+            "constraint program output count must match batching scalar count",
+        );
+        assert!(
+            flat_inputs.len() >= self.input_layout.total_slots(),
+            "flat input buffer requires at least {} values, got {}",
+            self.input_layout.total_slots(),
+            flat_inputs.len(),
+        );
+
+        let mut values: Vec<NF> = Vec::with_capacity(self.opcodes.len());
+
+        for idx in 0..self.opcodes.len() {
+            let value = match self.opcodes[idx] {
+                KernelOpcode::Constant => NF::from(self.constants[self.arg0[idx] as usize]),
+                KernelOpcode::Input => flat_inputs[self.arg0[idx] as usize],
+                KernelOpcode::Add => {
+                    values[self.arg0[idx] as usize] + values[self.arg1[idx] as usize]
+                }
+                KernelOpcode::Sub => {
+                    values[self.arg0[idx] as usize] - values[self.arg1[idx] as usize]
+                }
+                KernelOpcode::Neg => -values[self.arg0[idx] as usize],
+                KernelOpcode::Mul => {
+                    values[self.arg0[idx] as usize] * values[self.arg1[idx] as usize]
+                }
+            };
+            values.push(value);
+        }
+
         self.outputs
             .iter()
             .zip(batching_scalars)
-            .fold(EF::ExtensionPacking::ZERO, |acc, (&output, &alpha)| {
-                acc + Into::<EF::ExtensionPacking>::into(alpha)
-                    * Into::<EF::ExtensionPacking>::into(values[output])
-            })
+            .map(|(&output, &alpha)| alpha * values[output as usize])
+            .sum()
     }
+
+    #[must_use]
+    pub fn evaluate_batched_packed<EF>(
+        &self,
+        flat_inputs: &[F::Packing],
+        batching_scalars: &[EF],
+    ) -> EF::ExtensionPacking
+    where
+        EF: ExtensionField<F>,
+    {
+        assert_eq!(self.opcodes.len(), self.arg0.len());
+        assert_eq!(self.opcodes.len(), self.arg1.len());
+        assert_eq!(
+            self.outputs.len(),
+            batching_scalars.len(),
+            "constraint program output count must match batching scalar count",
+        );
+        assert!(
+            flat_inputs.len() >= self.input_layout.total_slots(),
+            "flat input buffer requires at least {} values, got {}",
+            self.input_layout.total_slots(),
+            flat_inputs.len(),
+        );
+
+        let mut values: Vec<F::Packing> = Vec::with_capacity(self.opcodes.len());
+
+        for idx in 0..self.opcodes.len() {
+            let value = match self.opcodes[idx] {
+                KernelOpcode::Constant => {
+                    F::Packing::from_fn(|_| self.constants[self.arg0[idx] as usize])
+                }
+                KernelOpcode::Input => flat_inputs[self.arg0[idx] as usize],
+                KernelOpcode::Add => {
+                    values[self.arg0[idx] as usize] + values[self.arg1[idx] as usize]
+                }
+                KernelOpcode::Sub => {
+                    values[self.arg0[idx] as usize] - values[self.arg1[idx] as usize]
+                }
+                KernelOpcode::Neg => -values[self.arg0[idx] as usize],
+                KernelOpcode::Mul => {
+                    values[self.arg0[idx] as usize] * values[self.arg1[idx] as usize]
+                }
+            };
+            values.push(value);
+        }
+
+        self.outputs.iter().zip(batching_scalars).fold(
+            EF::ExtensionPacking::ZERO,
+            |acc, (&output, &alpha)| {
+                acc + Into::<EF::ExtensionPacking>::into(alpha)
+                    * Into::<EF::ExtensionPacking>::into(values[output as usize])
+            },
+        )
+    }
+}
+
+impl CanonicalField32Config {
+    #[must_use]
+    pub fn add(self, lhs: u32, rhs: u32) -> u32 {
+        let sum = lhs as u64 + rhs as u64;
+        if sum >= self.order as u64 {
+            (sum - self.order as u64) as u32
+        } else {
+            sum as u32
+        }
+    }
+
+    #[must_use]
+    pub fn sub(self, lhs: u32, rhs: u32) -> u32 {
+        if lhs >= rhs {
+            lhs - rhs
+        } else {
+            self.order - (rhs - lhs)
+        }
+    }
+
+    #[must_use]
+    pub fn neg(self, value: u32) -> u32 {
+        if value == 0 {
+            0
+        } else {
+            self.order - value
+        }
+    }
+
+    #[must_use]
+    pub fn mul(self, lhs: u32, rhs: u32) -> u32 {
+        ((lhs as u64 * rhs as u64) % self.order as u64) as u32
+    }
+}
+
+impl CanonicalBinomialExtensionField32 {
+    #[must_use]
+    pub fn for_base_field<F, const D: usize>() -> Self
+    where
+        F: PrimeField32 + p3_field::extension::BinomiallyExtendable<D>,
+    {
+        Self {
+            degree: D,
+            w: F::W.as_canonical_u32(),
+        }
+    }
+}
+
+impl<F: PrimeField32> DeviceConstraintProgram<F> {
+    #[must_use]
+    pub fn encode_canonical_u32(&self) -> CanonicalDeviceConstraintProgram32 {
+        CanonicalDeviceConstraintProgram32 {
+            field: CanonicalField32Config {
+                order: F::ORDER_U32,
+            },
+            input_layout: self.input_layout,
+            constants: encode_canonical_u32_slice(&self.constants),
+            opcodes: self.opcodes.clone(),
+            arg0: self.arg0.clone(),
+            arg1: self.arg1.clone(),
+            outputs: self.outputs.clone(),
+            unsupported_features: self.unsupported_features.clone(),
+            max_constraint_degree: self.max_constraint_degree,
+        }
+    }
+}
+
+impl CanonicalDeviceConstraintProgram32 {
+    #[must_use]
+    pub fn evaluate_batched_binomial_extension(
+        &self,
+        flat_inputs: &[u32],
+        batching_scalars: &[u32],
+        eq_mle: Option<&[u32]>,
+        extension: CanonicalBinomialExtensionField32,
+    ) -> Vec<u32> {
+        assert_eq!(self.opcodes.len(), self.arg0.len());
+        assert_eq!(self.opcodes.len(), self.arg1.len());
+        assert_eq!(
+            batching_scalars.len(),
+            self.outputs.len() * extension.degree,
+            "serialized batching scalar count must match output count times extension degree",
+        );
+        assert!(
+            flat_inputs.len() >= self.input_layout.total_slots(),
+            "flat input buffer requires at least {} values, got {}",
+            self.input_layout.total_slots(),
+            flat_inputs.len(),
+        );
+        if let Some(eq_mle) = eq_mle {
+            assert_eq!(
+                eq_mle.len(),
+                extension.degree,
+                "serialized eq MLE value must match extension degree",
+            );
+        }
+
+        let mut values: Vec<u32> = Vec::with_capacity(self.opcodes.len());
+
+        for idx in 0..self.opcodes.len() {
+            let value = match self.opcodes[idx] {
+                KernelOpcode::Constant => self.constants[self.arg0[idx] as usize],
+                KernelOpcode::Input => flat_inputs[self.arg0[idx] as usize],
+                KernelOpcode::Add => self.field.add(
+                    values[self.arg0[idx] as usize],
+                    values[self.arg1[idx] as usize],
+                ),
+                KernelOpcode::Sub => self.field.sub(
+                    values[self.arg0[idx] as usize],
+                    values[self.arg1[idx] as usize],
+                ),
+                KernelOpcode::Neg => self.field.neg(values[self.arg0[idx] as usize]),
+                KernelOpcode::Mul => self.field.mul(
+                    values[self.arg0[idx] as usize],
+                    values[self.arg1[idx] as usize],
+                ),
+            };
+            values.push(value);
+        }
+
+        let mut acc = vec![0u32; extension.degree];
+        for (&output, scalar_coeffs) in self
+            .outputs
+            .iter()
+            .zip(batching_scalars.chunks_exact(extension.degree))
+        {
+            let value = values[output as usize];
+            for (acc_coeff, &scalar_coeff) in acc.iter_mut().zip(scalar_coeffs) {
+                *acc_coeff = self
+                    .field
+                    .add(*acc_coeff, self.field.mul(value, scalar_coeff));
+            }
+        }
+
+        eq_mle.map_or(acc.clone(), |eq_mle| {
+            mul_binomial_extension_u32(&acc, eq_mle, self.field, extension)
+        })
+    }
+}
+
+#[must_use]
+pub fn encode_canonical_u32_slice<F: PrimeField32>(values: &[F]) -> Vec<u32> {
+    values.iter().map(PrimeField32::as_canonical_u32).collect()
+}
+
+#[must_use]
+pub fn encode_canonical_basis_u32<F, A>(values: &[A]) -> Vec<u32>
+where
+    F: PrimeField32,
+    A: BasedVectorSpace<F>,
+{
+    values
+        .iter()
+        .flat_map(|value| {
+            value
+                .as_basis_coefficients_slice()
+                .iter()
+                .map(PrimeField32::as_canonical_u32)
+        })
+        .collect()
+}
+
+#[must_use]
+pub fn decode_canonical_basis_u32<F, A>(coefficients: &[u32]) -> Vec<A>
+where
+    F: PrimeField32,
+    A: BasedVectorSpace<F>,
+{
+    assert!(
+        coefficients.len().is_multiple_of(A::DIMENSION),
+        "serialized coefficient count must be divisible by the basis dimension",
+    );
+
+    coefficients
+        .chunks_exact(A::DIMENSION)
+        .map(|chunk| {
+            A::from_basis_coefficients_iter(chunk.iter().copied().map(F::from_int))
+                .expect("serialized basis chunk should match the target basis dimension")
+        })
+        .collect()
+}
+
+fn mul_binomial_extension_u32(
+    lhs: &[u32],
+    rhs: &[u32],
+    field: CanonicalField32Config,
+    extension: CanonicalBinomialExtensionField32,
+) -> Vec<u32> {
+    assert_eq!(lhs.len(), extension.degree);
+    assert_eq!(rhs.len(), extension.degree);
+
+    let mut acc = vec![0u32; extension.degree];
+    for (lhs_idx, &lhs_coeff) in lhs.iter().enumerate() {
+        for (rhs_idx, &rhs_coeff) in rhs.iter().enumerate() {
+            let mut term = field.mul(lhs_coeff, rhs_coeff);
+            let target = lhs_idx + rhs_idx;
+            let slot = if target >= extension.degree {
+                term = field.mul(term, extension.w);
+                target - extension.degree
+            } else {
+                target
+            };
+            acc[slot] = field.add(acc[slot], term);
+        }
+    }
+
+    acc
 }
 
 #[must_use]
@@ -847,8 +1317,8 @@ fn push_unsupported(
 mod tests {
     use p3_air::{Air, AirBuilder, BaseAir};
     use p3_field::{
-        BasedVectorSpace, ExtensionField, Field, PackedValue, PrimeCharacteristicRing,
-        extension::BinomialExtensionField,
+        extension::BinomialExtensionField, BasedVectorSpace, ExtensionField, Field, PackedValue,
+        PrimeCharacteristicRing, PrimeField32,
     };
     use p3_koala_bear::KoalaBear;
     use p3_matrix::Matrix;
@@ -923,6 +1393,7 @@ mod tests {
     fn batched_execution_matches_constraint_outputs() {
         let program = compile_air_constraint_program::<KoalaBear, _>(&ArithmeticAir, 0, 0);
         let lowered = program.lower();
+        let device = lowered.encode_for_device();
         let local = [KoalaBear::new(2), KoalaBear::new(3)];
         let next = [KoalaBear::ZERO, KoalaBear::ZERO];
         let inputs = ConstraintProgramInputs::for_main_row(&local, &next, 0, 2);
@@ -930,17 +1401,26 @@ mod tests {
 
         let outputs = program.evaluate(&inputs);
         let batched = program.evaluate_batched(&inputs, &batching_scalars);
-        let flat_inputs = lowered.input_layout.flatten_inputs(&inputs);
+        let flat_inputs = lowered.input_layout.flatten_main_pair(
+            &local,
+            &next,
+            KoalaBear::ONE,
+            KoalaBear::ZERO,
+            KoalaBear::ONE,
+        );
         let lowered_batched = lowered.evaluate_batched(&flat_inputs, &batching_scalars);
+        let device_batched = device.evaluate_batched(&flat_inputs, &batching_scalars);
 
         assert_eq!(batched, batching_scalars[0] * outputs[0]);
         assert_eq!(lowered_batched, batched);
+        assert_eq!(device_batched, batched);
     }
 
     #[test]
     fn packed_batched_execution_matches_scalar_lanes() {
         let program = compile_air_constraint_program::<KoalaBear, _>(&ArithmeticAir, 0, 0);
         let lowered = program.lower();
+        let device = lowered.encode_for_device();
         let local0 = PF::from_fn(|idx| KoalaBear::new(idx as u32 + 2));
         let local1 = PF::from_fn(|idx| KoalaBear::new(idx as u32 + 3));
         let next0 = PF::from_fn(|_| KoalaBear::ZERO);
@@ -960,11 +1440,18 @@ mod tests {
         let batching_scalars = [EF::from(KoalaBear::new(5))];
 
         let packed = program.evaluate_batched_packed(&packed_inputs, &batching_scalars);
-        let flat_inputs = lowered.input_layout.flatten_inputs(&packed_inputs);
+        let flat_inputs = lowered.input_layout.flatten_main_pair(
+            &local_rows,
+            &next_rows,
+            PF::from_fn(|_| KoalaBear::ZERO),
+            PF::from_fn(|_| KoalaBear::ZERO),
+            PF::from_fn(|_| KoalaBear::ONE),
+        );
         let lowered_packed = lowered.evaluate_batched_packed(&flat_inputs, &batching_scalars);
+        let device_packed = device.evaluate_batched_packed(&flat_inputs, &batching_scalars);
         let actual = (0..PF::WIDTH)
             .map(|idx| {
-                let packed = lowered_packed;
+                let packed = device_packed;
                 EF::from_basis_coefficients_fn(|coeff_idx| {
                     <PEF as BasedVectorSpace<PF>>::as_basis_coefficients_slice(&packed)[coeff_idx]
                         .as_slice()[idx]
@@ -987,7 +1474,65 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(lowered_packed, packed);
+        assert_eq!(device_packed, packed);
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn canonical_device_program_matches_batched_extension_sum() {
+        let program = compile_air_constraint_program::<KoalaBear, _>(&ArithmeticAir, 0, 0);
+        let lowered = program.lower();
+        let device = lowered.encode_for_device();
+        let canonical = device.encode_canonical_u32();
+        let local = [KoalaBear::new(2), KoalaBear::new(3)];
+        let next = [KoalaBear::ZERO, KoalaBear::ZERO];
+        let batching_scalars = [EF::from_basis_coefficients_fn(|idx| match idx {
+            0 => KoalaBear::new(5),
+            1 => KoalaBear::new(7),
+            2 => KoalaBear::new(11),
+            3 => KoalaBear::new(13),
+            _ => KoalaBear::ZERO,
+        })];
+        let eq = EF::from_basis_coefficients_fn(|idx| match idx {
+            0 => KoalaBear::new(17),
+            1 => KoalaBear::new(19),
+            2 => KoalaBear::new(23),
+            3 => KoalaBear::new(29),
+            _ => KoalaBear::ZERO,
+        });
+        let flat_inputs = lowered.input_layout.flatten_main_pair(
+            &local,
+            &next,
+            KoalaBear::ONE,
+            KoalaBear::ZERO,
+            KoalaBear::ONE,
+        );
+
+        let actual = canonical.evaluate_batched_binomial_extension(
+            &encode_canonical_u32_slice(&flat_inputs),
+            &encode_canonical_basis_u32::<KoalaBear, EF>(&batching_scalars),
+            Some(&encode_canonical_basis_u32::<KoalaBear, EF>(
+                std::slice::from_ref(&eq),
+            )),
+            CanonicalBinomialExtensionField32::for_base_field::<KoalaBear, 8>(),
+        );
+        let decoded = decode_canonical_basis_u32::<KoalaBear, EF>(&actual)
+            .into_iter()
+            .next()
+            .expect("encoded result should decode to one extension element");
+        let expected = program.evaluate_batched(
+            &ConstraintProgramInputs::new(
+                &local,
+                &next,
+                KoalaBear::ONE,
+                KoalaBear::ZERO,
+                KoalaBear::ONE,
+            ),
+            &batching_scalars,
+        ) * eq;
+
+        assert_eq!(canonical.field.order, KoalaBear::ORDER_U32);
+        assert_eq!(decoded, expected);
     }
 
     #[test]

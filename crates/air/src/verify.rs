@@ -1,24 +1,24 @@
 use p3_air::Air;
 use p3_challenger::{FieldChallenger, GrindingChallenger};
-use p3_field::{ExtensionField, Packable, TwoAdicField, cyclic_subgroup_known_order, dot_product};
+use p3_field::{cyclic_subgroup_known_order, dot_product, ExtensionField, Packable, TwoAdicField};
 use p3_symmetric::{CryptographicHasher, PseudoCompressionFunction};
 use serde::{Deserialize, Serialize};
 use sumcheck::{SumcheckComputation, SumcheckError, SumcheckGrinding};
 use tracing::instrument;
-use utils::{ConstraintFolder, fold_multilinear_in_large_field, log2_up};
+use utils::{fold_multilinear_in_large_field, log2_up, ConstraintFolder};
 use whir_p3::{
     fiat_shamir::{errors::ProofError, verifier::VerifierState},
     poly::{evals::EvaluationsList, multilinear::MultilinearPoint},
     whir::{
         committer::reader::CommitmentReader,
-        statement::{Statement, weights::Weights},
+        statement::{weights::Weights, Statement},
         verifier::Verifier,
     },
 };
 
 use crate::{
-    AirSettings,
     utils::{column_down, column_up, matrix_down_lde, matrix_up_lde},
+    AirSettings,
 };
 
 use super::table::AirTable;
@@ -46,10 +46,10 @@ impl From<SumcheckError> for AirVerifError {
 }
 
 impl<
-    F: TwoAdicField,
-    EF: ExtensionField<F> + TwoAdicField,
-    A: for<'a> Air<ConstraintFolder<'a, F, EF, EF>>,
-> AirTable<F, EF, A>
+        F: TwoAdicField,
+        EF: ExtensionField<F> + TwoAdicField,
+        A: for<'a> Air<ConstraintFolder<'a, F, EF, EF>>,
+    > AirTable<F, EF, A>
 {
     #[instrument(name = "air table: verify", skip_all)]
     pub fn verify<H, C, Challenger, const DIGEST_ELEMS: usize>(

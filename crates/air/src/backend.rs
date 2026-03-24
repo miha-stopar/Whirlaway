@@ -3,16 +3,16 @@ use tracing::instrument;
 use utils::{add_multilinears, multilinears_linear_combination};
 use whir_p3::poly::{evals::EvaluationsList, multilinear::MultilinearPoint};
 
-use crate::utils::{column_down, column_up};
-
 #[cfg(feature = "gpu")]
-use p3_field::{Packable, PackedFieldExtension, PackedValue};
-#[cfg(feature = "gpu")]
-use rayon::prelude::*;
+use p3_field::{BasedVectorSpace, PrimeField32};
 #[cfg(feature = "gpu")]
 use sumcheck::HypercubeEvaluator;
+
 #[cfg(feature = "gpu")]
-use crate::kernel_ir::{ConstraintProgramInputs, LoweredConstraintProgram, RowPair};
+use crate::device_backend;
+#[cfg(feature = "gpu")]
+use crate::kernel_ir::DeviceConstraintProgram;
+use crate::utils::{column_down, column_up};
 
 pub(crate) struct BatchedWitness<EF> {
     pub(crate) batched_column: EvaluationsList<EF>,
@@ -22,26 +22,26 @@ pub(crate) struct BatchedWitness<EF> {
 
 #[cfg(feature = "gpu")]
 pub(crate) struct ConstraintProgramHypercubeEvaluator<'a, F> {
-    program: &'a LoweredConstraintProgram<F>,
+    program: &'a DeviceConstraintProgram<F>,
 }
 
 #[cfg(feature = "gpu")]
 impl<'a, F> ConstraintProgramHypercubeEvaluator<'a, F> {
     #[must_use]
-    pub(crate) const fn new(program: &'a LoweredConstraintProgram<F>) -> Self {
+    pub(crate) const fn new(program: &'a DeviceConstraintProgram<F>) -> Self {
         Self { program }
     }
 }
 
 #[cfg(feature = "gpu")]
 pub(crate) struct ConstraintProgramExtensionHypercubeEvaluator<'a, F> {
-    program: &'a LoweredConstraintProgram<F>,
+    program: &'a DeviceConstraintProgram<F>,
 }
 
 #[cfg(feature = "gpu")]
 impl<'a, F> ConstraintProgramExtensionHypercubeEvaluator<'a, F> {
     #[must_use]
-    pub(crate) const fn new(program: &'a LoweredConstraintProgram<F>) -> Self {
+    pub(crate) const fn new(program: &'a DeviceConstraintProgram<F>) -> Self {
         Self { program }
     }
 }
@@ -49,8 +49,8 @@ impl<'a, F> ConstraintProgramExtensionHypercubeEvaluator<'a, F> {
 #[cfg(feature = "gpu")]
 impl<F, EF, A> HypercubeEvaluator<F, F, EF, A> for ConstraintProgramHypercubeEvaluator<'_, F>
 where
-    F: Field + Packable,
-    EF: ExtensionField<F>,
+    F: Field + p3_field::Packable + PrimeField32,
+    EF: ExtensionField<F> + BasedVectorSpace<F>,
     A: Sync,
 {
     fn compute(
@@ -60,53 +60,7 @@ where
         batching_scalars: &[EF],
         eq_mle: Option<&EvaluationsList<EF>>,
     ) -> EF {
-        assert!(
-            pols.iter()
-                .all(|p| p.num_variables() == pols[0].num_variables())
-        );
-        assert!(
-            pols.len().is_multiple_of(2),
-            "compiled AIR evaluator expects local/next column pairs",
-        );
-
-        let n_chunks = pols[0].num_evals() / F::Packing::WIDTH;
-        let width = pols.len() / 2;
-        let packed_pols = pols
-            .iter()
-            .map(|poly| F::Packing::pack_slice(poly.evals()))
-            .collect::<Vec<_>>();
-        let packed_zero = F::Packing::from_fn(|_| F::ZERO);
-
-        (0..n_chunks)
-            .into_par_iter()
-            .map(|chunk_idx| {
-                let mut local = Vec::with_capacity(width);
-                let mut next = Vec::with_capacity(width);
-                local.extend(packed_pols[..width].iter().map(|poly| poly[chunk_idx]));
-                next.extend(packed_pols[width..].iter().map(|poly| poly[chunk_idx]));
-
-                let inputs = ConstraintProgramInputs {
-                    main: RowPair::new(&local, &next),
-                    preprocessed: RowPair::empty(),
-                    permutation: RowPair::empty(),
-                    public_values: &[],
-                    challenges: &[],
-                    is_first_row: packed_zero,
-                    is_last_row: packed_zero,
-                    is_transition: packed_zero,
-                };
-                let flat_inputs = self.program.input_layout.flatten_inputs(&inputs);
-                let mut value = self
-                    .program
-                    .evaluate_batched_packed(&flat_inputs, batching_scalars);
-                if let Some(eq_mle) = eq_mle {
-                    let start = chunk_idx * F::Packing::WIDTH;
-                    let end = start + F::Packing::WIDTH;
-                    value *= EF::ExtensionPacking::from_ext_slice(&eq_mle.evals()[start..end]);
-                }
-                EF::ExtensionPacking::to_ext_iter(std::iter::once(value)).sum::<EF>()
-            })
-            .sum()
+        device_backend::evaluate_packed_main_pairs(self.program, pols, batching_scalars, eq_mle)
     }
 }
 
@@ -125,32 +79,7 @@ where
         batching_scalars: &[EF],
         eq_mle: Option<&EvaluationsList<EF>>,
     ) -> EF {
-        assert!(
-            pols.iter()
-                .all(|p| p.num_variables() == pols[0].num_variables())
-        );
-        assert!(
-            pols.len().is_multiple_of(2),
-            "compiled AIR evaluator expects local/next column pairs",
-        );
-
-        let width = pols.len() / 2;
-
-        (0..pols[0].num_evals())
-            .into_par_iter()
-            .map(|idx| {
-                let mut local = Vec::with_capacity(width);
-                let mut next = Vec::with_capacity(width);
-                local.extend(pols[..width].iter().map(|poly| poly.evals()[idx]));
-                next.extend(pols[width..].iter().map(|poly| poly.evals()[idx]));
-                let inputs = ConstraintProgramInputs::new(&local, &next, EF::ZERO, EF::ZERO, EF::ZERO);
-                let flat_inputs = self.program.input_layout.flatten_inputs(&inputs);
-                let value = self
-                    .program
-                    .evaluate_batched_in_extension(&flat_inputs, batching_scalars);
-                eq_mle.map_or(value, |eq| value * eq.evals()[idx])
-            })
-            .sum()
+        device_backend::evaluate_extension_main_pairs(self.program, pols, batching_scalars, eq_mle)
     }
 }
 
@@ -288,15 +217,15 @@ mod tests {
     #[cfg(feature = "gpu")]
     use p3_air::{Air, AirBuilder, BaseAir};
     use p3_field::extension::BinomialExtensionField;
-    use p3_koala_bear::KoalaBear;
     #[cfg(feature = "gpu")]
     use p3_field::PrimeCharacteristicRing;
+    use p3_koala_bear::KoalaBear;
     #[cfg(feature = "gpu")]
     use p3_matrix::Matrix;
 
     use super::*;
     #[cfg(feature = "gpu")]
-    use crate::kernel_ir::{ConstraintProgramInputs, compile_air_constraint_program};
+    use crate::kernel_ir::{compile_air_constraint_program, ConstraintProgramInputs};
 
     type F = KoalaBear;
     type EF = BinomialExtensionField<F, 8>;
@@ -382,7 +311,8 @@ mod tests {
     fn compiled_constraint_program_evaluator_matches_scalar_sum() {
         let program = compile_air_constraint_program::<F, _>(&ArithmeticAir, 0, 0);
         let lowered_program = program.lower();
-        let evaluator = ConstraintProgramHypercubeEvaluator::new(&lowered_program);
+        let device_program = lowered_program.encode_for_device();
+        let evaluator = ConstraintProgramHypercubeEvaluator::new(&device_program);
         let pols = vec![
             base_poly(&[2, 3, 4, 5]),
             base_poly(&[6, 7, 8, 9]),
@@ -392,15 +322,13 @@ mod tests {
         let batching_scalars = vec![ext(19)];
         let eq_mle = EvaluationsList::new(vec![ext(23), ext(29), ext(31), ext(37)]);
 
-        let actual =
-            evaluator.compute(&pols, &ArithmeticAir, &batching_scalars, Some(&eq_mle));
+        let actual = evaluator.compute(&pols, &ArithmeticAir, &batching_scalars, Some(&eq_mle));
 
         let expected = (0..pols[0].num_evals())
             .map(|idx| {
                 let local = [pols[0].evals()[idx], pols[1].evals()[idx]];
                 let next = [pols[2].evals()[idx], pols[3].evals()[idx]];
-                let inputs =
-                    ConstraintProgramInputs::new(&local, &next, F::ZERO, F::ZERO, F::ONE);
+                let inputs = ConstraintProgramInputs::new(&local, &next, F::ZERO, F::ZERO, F::ONE);
                 program.evaluate_batched(&inputs, &batching_scalars) * eq_mle.evals()[idx]
             })
             .sum::<EF>();

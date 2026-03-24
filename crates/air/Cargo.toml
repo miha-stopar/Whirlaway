@@ -23,6 +23,13 @@ p3-uni-stark.workspace = true
 p3-challenger.workspace = true
 p3-util.workspace = true
 serde.workspace = true
+smallvec = "1.13.2"
+bytemuck = { version = "1.21.0", features = ["derive"] }
+pollster = "0.3.0"
+wgpu = "23.0.1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = "0.29.0"
 
 [dev-dependencies]
 p3-koala-bear.workspace = true

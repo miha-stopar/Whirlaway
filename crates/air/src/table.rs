@@ -2,7 +2,9 @@ use p3_air::Air;
 use p3_challenger::{FieldChallenger, GrindingChallenger};
 use p3_field::{ExtensionField, Field, TwoAdicField};
 
-use p3_uni_stark::{SymbolicAirBuilder, get_symbolic_constraints};
+#[cfg(not(feature = "gpu"))]
+use p3_uni_stark::get_symbolic_constraints;
+use p3_uni_stark::SymbolicAirBuilder;
 use utils::{log2_up, univariate_selectors};
 use whir_p3::{
     parameters::{MultivariateParameters, ProtocolParameters},
@@ -10,6 +12,8 @@ use whir_p3::{
     whir::parameters::WhirConfig,
 };
 
+#[cfg(feature = "gpu")]
+use crate::kernel_ir::{compile_air_constraint_program, DeviceConstraintProgram};
 use crate::{AirSettings, WHIR_POW_BITS};
 
 pub struct AirTable<F: Field, EF, A> {
@@ -20,6 +24,8 @@ pub struct AirTable<F: Field, EF, A> {
     pub n_constraints: usize,
     pub constraint_degree: usize,
     pub(crate) univariate_selectors: Vec<WhirDensePolynomial<F>>,
+    #[cfg(feature = "gpu")]
+    pub(crate) device_constraint_program: Option<DeviceConstraintProgram<F>>,
 
     _phantom: std::marker::PhantomData<EF>,
 }
@@ -39,7 +45,18 @@ where
     where
         A: Air<SymbolicAirBuilder<F>>,
     {
+        #[cfg(feature = "gpu")]
+        let compiled_constraint_program = compile_air_constraint_program::<F, _>(&air, 0, 0);
+        #[cfg(feature = "gpu")]
+        let n_constraints = compiled_constraint_program.outputs.len();
+        #[cfg(feature = "gpu")]
+        let device_constraint_program = compiled_constraint_program
+            .is_gpu_candidate()
+            .then(|| compiled_constraint_program.lower().encode_for_device());
+
+        #[cfg(not(feature = "gpu"))]
         let symbolic_constraints = get_symbolic_constraints(&air, 0, 0);
+        #[cfg(not(feature = "gpu"))]
         let n_constraints = symbolic_constraints.len();
 
         Self {
@@ -50,6 +67,8 @@ where
             n_constraints,
             constraint_degree,
             univariate_selectors: univariate_selectors(univariate_skips),
+            #[cfg(feature = "gpu")]
+            device_constraint_program,
             _phantom: std::marker::PhantomData,
         }
     }

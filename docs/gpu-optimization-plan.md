@@ -76,9 +76,16 @@ This branch documents and tracks GPU-focused optimization attempts for proving.
 - Progress: that IR is now executable on CPU via `ConstraintProgram::evaluate`, so we can validate compiled constraint programs against the existing symbolic AIR path before introducing device kernels.
 - Progress: the zerocheck hot loop can now consume that compiled IR through a custom hypercube evaluator, but only when building with `--features gpu`.
 - Progress: the GPU-feature evaluator now runs against a lowered flat-input program layout, so the AIR kernel is represented as opcode stream plus input slots rather than repeated `KernelInput` decoding.
+- Progress: that lowered program is now encoded as a device-style kernel tape with explicit opcodes, operand arrays, constants, and output indices, and the `gpu`-feature host fallback executes through that same tape.
+- Progress: the encoded kernel tape is now cached in `AirTable`, so AIR program compile/lower/encode happens once at table construction instead of once per proof.
+- Progress: the encoded AIR-tape executor now sits behind `air::device_backend`, so a real GPU runtime can replace the current host fallback without another prover-path refactor.
+- Progress: the encoded AIR tape now has a canonical `u32` payload path for 32-bit prime fields and binomial extensions, with parity coverage against the current batched extension evaluation. That gives a future GPU runtime a concrete buffer contract instead of generic Rust field objects.
+- Progress: `air::device_backend` now has two real packed-base AIR-tape runtimes: a native `Metal` executor on macOS and a portable `wgpu` executor. Backend selection is controlled by `WHIRLAWAY_GPU_BACKEND=auto|metal|wgpu`, with `auto` preferring `Metal` on macOS and falling back to `wgpu`.
+- Validation: both runtime backends execute the compiled AIR-tape parity test successfully via `WHIRLAWAY_GPU_BACKEND=metal cargo test -p air --features gpu backend::tests::compiled_constraint_program_evaluator_matches_scalar_sum -- --nocapture` and `WHIRLAWAY_GPU_BACKEND=wgpu cargo test -p air --features gpu backend::tests::compiled_constraint_program_evaluator_matches_scalar_sum -- --nocapture`.
 - Validation: the Poseidon2 AIR remains a GPU-candidate subset (`148` constraints, `0` unsupported features), and the compiled program now matches the original symbolic constraints on generated trace rows.
 - Caveat: using the compiled IR interpreter as the default CPU prover path regressed the `2^16` Poseidon2 benchmark by about 25%, so the new evaluator is currently feature-gated while the host fallback is tuned or replaced with a real device backend.
-- Caveat: even after lowering to the flat-input plan, the `gpu`-feature host fallback still measured about `1.86s` at `log_n_rows = 16`, so further host-side interpreter work is unlikely to beat the existing callback path by itself.
+- Update: the device-tape executor improved the `gpu`-feature `log_n_rows = 16` Poseidon2 case to about `1.59s` median after caching the encoded tape, down from the previous `1.84s` median, but it is still slower than the stable CPU baseline (`1.38s` median).
+- Current limitation: only the packed base-field AIR evaluation path is offloaded today. The extension-input zerocheck rounds still use the CPU fallback until the device payload learns how to serialize extension-valued row inputs.
 
 ## Protocol Reference
 
